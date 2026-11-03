@@ -1,0 +1,12 @@
+{
+  "kind": "WaveLink.ProtocolProfiles", "schemaVersion": 1,
+  "profiles": [{
+    "id": "f75b780c-b3a8-42a8-8f2a-8adeb18a3991", "revision": 1,
+    "name": "文本分隔测试", "type": "text",
+    "frame": {"encoding": "utf8", "terminatorHex": "0D0A", "prefix": "DATA:", "suffix": "", "delimiterMode": "literal", "delimiter": ",", "trimFields": true, "maxFrameBytes": 4096},
+    "channels": [
+      {"id": "temperature", "name": "温度", "column": 0, "scale": 1, "bias": 0},
+      {"id": "voltage", "name": "电压", "column": 1, "scale": 1, "bias": 0}
+    ]
+  }]
+}

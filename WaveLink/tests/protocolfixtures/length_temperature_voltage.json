@@ -1,0 +1,14 @@
+{
+  "kind": "WaveLink.ProtocolProfiles", "schemaVersion": 1,
+  "profiles": [{
+    "id": "a0c4438e-e40f-4664-bddb-4194b659adca", "revision": 1,
+    "name": "变长固定字段测试", "type": "binary", "byteOrder": "little",
+    "frame": {"mode": "length", "headerHex": "AA55", "tailHex": "0D0A", "minFrameBytes": 12, "payloadOffset": 3, "payloadBytes": 6, "maxFrameBytes": 4096,
+      "lengthField": {"offset": 2, "type": "uint8", "meaning": "payload-bytes", "unitBytes": 1, "adjustment": 6}},
+    "checksum": {"algorithm": "sum8", "range": {"offset": 0, "endOffset": 3}, "field": {"from": "end", "offset": 3, "type": "uint8"}},
+    "channels": [
+      {"id": "temperature", "name": "温度", "offset": 0, "type": "int16", "scale": 0.01, "bias": 0},
+      {"id": "voltage", "name": "电压", "offset": 2, "type": "float32", "scale": 1, "bias": 0}
+    ]
+  }]
+}

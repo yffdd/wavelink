@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.15)
+project(WaveLinkBleHost LANGUAGES CXX)
+if(NOT WIN32 OR NOT MSVC)
+    message(FATAL_ERROR "WaveLinkBleHost requires MSVC and the Windows 10/11 SDK.")
+endif()
+add_executable(WaveLinkBleHost main.cpp filereader.cpp)
+target_compile_features(WaveLinkBleHost PRIVATE cxx_std_20)
+target_compile_options(WaveLinkBleHost PRIVATE /utf-8 /W4 /EHsc)
+target_compile_definitions(WaveLinkBleHost PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(WaveLinkBleHost PRIVATE windowsapp)
+# Use the static CRT so the portable helper does not need an MSVC runtime installer.
+set_property(TARGET WaveLinkBleHost PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

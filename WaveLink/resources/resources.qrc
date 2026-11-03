@@ -1,0 +1,8 @@
+<RCC>
+    <qresource prefix="/">
+        <file>app.ico</file>
+        <file>checkmark.png</file>
+        <file>CH341.zip</file>
+        <file>CoilCalculator.exe</file>
+    </qresource>
+</RCC>

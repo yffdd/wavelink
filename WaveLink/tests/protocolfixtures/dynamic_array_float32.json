@@ -1,0 +1,10 @@
+{
+  "kind": "WaveLink.ProtocolProfiles", "schemaVersion": 1,
+  "profiles": [{
+    "id": "fb6a0697-4d65-4857-8882-bf9be66c5fbb", "revision": 1,
+    "name": "变长动态数组测试", "type": "binary", "byteOrder": "little",
+    "array": {"type": "float32", "minChannels": 1, "maxChannels": 256}, "channels": [],
+    "frame": {"mode": "length", "headerHex": "AA55", "tailHex": "0D0A", "payloadOffset": 4, "payloadEndOffset": 2, "minFrameBytes": 10, "maxFrameBytes": 4096,
+      "lengthField": {"offset": 2, "type": "uint16", "byteOrder": "little", "meaning": "payload-bytes", "unitBytes": 1, "adjustment": 6}}
+  }]
+}

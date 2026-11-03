@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="source.zip">@WAVELINK_SOURCE_ARCHIVE_QRC_PATH@</file>
+    </qresource>
+</RCC>

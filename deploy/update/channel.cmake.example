@@ -1,0 +1,4 @@
+# Copy to channel.cmake after choosing your HTTPS hosting provider.
+# Public information only; this file is embedded in every application build.
+set(WAVELINK_UPDATE_FEED_URL "https://updates.example.com/wavelink/stable/latest.json")
+set(WAVELINK_UPDATE_PUBLIC_KEY "PASTE_BASE64_BCRYPT_RSAPUBLIC_BLOB_HERE")

@@ -1,0 +1,5 @@
+{
+  "installerBaseUrl": "https://github.com/yffdd/wavelink/releases/download/v{version}",
+  "signingKey": "C:/Users/YOUR_USER/.wavelink-release/update-signing.key",
+  "notesSource": "currentChangelog"
+}

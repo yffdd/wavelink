@@ -1,0 +1,17 @@
+{
+  "kind": "WaveLink.ProtocolProfiles", "schemaVersion": 1,
+  "profiles": [{
+    "id": "1ad1e993-0eae-42db-8f4d-a8fde196e5f8",
+    "revision": 1,
+    "name": "JustFloat 式首尾分隔",
+    "description": "N 个小端 float32 + 0000807F；无帧头、无长度、无校验，1–256 路。按原始二进制字节发送，数据不能包含相同帧尾。",
+    "type": "binary",
+    "byteOrder": "little",
+    "outOfRangePolicy": "nan-channel",
+    "autoFrameLayout": true,
+    "array": {"type": "float32", "minChannels": 1, "maxChannels": 256},
+    "frame": {"mode": "delimiter", "headerHex": "", "tailHex": "0000807F", "payloadOffset": 0, "payloadEndOffset": 4, "minFrameBytes": 8, "maxFrameBytes": 4096},
+    "checksum": {"algorithm": "none"},
+    "channels": []
+  }]
+}

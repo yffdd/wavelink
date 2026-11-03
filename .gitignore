@@ -1,68 +1,71 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
+# C/C++ compiler and linker output
 *.o
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
+*.lo
+*.d
 *.a
 *.lib
-
-# Executables
+*.dll
+*.so
+*.so.*
+*.dylib
 *.exe
 *.out
-*.app
+*.pdb
+*.ilk
+*.exp
+*.res
+*.aps
+*.pch
+*.gch
 
-# Build directories
+# CMake, Ninja and Qt Creator build output and local settings
 build/
-Build/
 build-*/
-
-# CMake generated files
+cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
-Makefile
+CTestTestfile.cmake
 install_manifest.txt
 compile_commands.json
+Testing/
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+*_autogen/
+CMakeLists.txt.user*
+*.pro.user*
+.qmake.stash
 
-# Temporary files
+# Installer output and local publishing configuration
+/deploy/setup/_Setup_Work/
+/deploy/setup/WaveLink_Release/
+/deploy/setup/latest.json
+/deploy/setup/WaveLink_v*_ReleaseNotes.txt
+/deploy/setup/WaveLink_v*_Windows_x64_Setup.exe
+/deploy/update/publish.local.json
+
+# The optional source archive is generated during packaging.
+/WaveLink/resources/source.zip
+
+# Qt embeds this executable as a project resource.
+!/WaveLink/resources/CoilCalculator.exe
+
+# Additional output and cache rules from the GitHub repository
+*.slo
+*.mod
+*.smod
+*.lai
+*.la
+*.app
+Build/
+Makefile
 *.tmp
 *.log
 *.bak
 *.swp
-
-# vcpkg
 vcpkg_installed/
-
-# debug information files
 *.dwo
-
-# test output & cache
-Testing/
 .cache/
