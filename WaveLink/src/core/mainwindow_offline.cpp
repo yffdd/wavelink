@@ -3,6 +3,7 @@
 #include "systemsettingsdialog.h"
 #include "waveformgraph.h"
 #include "recordingchannelnames.h"
+#include "rangeslider.h"
 #include "waveimportbudget.h"
 #include <QApplication>
 #include <QMessageBox>
@@ -53,6 +54,7 @@ void MainWindow::restoreOfflineFilters(const OfflineFilterSpec &spec) {
 QSharedPointer<OfflineWaveStore> MainWindow::filterOfflineStore(const QSharedPointer<OfflineWaveStore> &raw, const OfflineFilterSpec &spec, bool &canceled, QString &error) {
     canceled = false; if (!spec.active()) return raw;
     QProgressDialog progress(QStringLiteral("正在连续计算大文件滤波并建立索引……"), QStringLiteral("取消"), 0, 1000, this);
+    progress.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
     progress.setObjectName("offlineFilterProgress"); progress.setWindowTitle(QStringLiteral("大文件滤波")); progress.setWindowModality(Qt::WindowModal); progress.setMinimumDuration(0);
     const auto filtered = raw->filtered(spec, [&](qint64 row, qint64 total) {
         progress.setValue(int(1000.0 * row / qMax<qint64>(1, total))); QApplication::processEvents();
@@ -64,7 +66,7 @@ QSharedPointer<OfflineWaveStore> MainWindow::filterOfflineStore(const QSharedPoi
 void MainWindow::showImportAdvice(const QString &error) {
     QMessageBox message(this); message.setObjectName("offlineImportAdvice"); message.setWindowTitle(QStringLiteral("导入失败"));
     message.setIcon(QMessageBox::Warning);
-    message.setText(error + QStringLiteral("\n\n建议：\n• 内存或索引额度不足：在“系统设置 → 绘图显示”调整“离线完整加载上限”；较低额度会更早转为按需浏览。\n• 浏览缓存写入失败：在“数据存储”选择有足够空间且可写的本机缓存路径。\n• 文件格式或分卷错误：检查提示中的文件/行号，重新导出数据，或整理成独立文件。\n\n本次未替换当前波形，也不会修改原始文件。"));
+    message.setText(error + QStringLiteral("\n\n建议：\n• 完整加载或索引额度不足：前往「设置 → 系统设置 → 绘图显示 → 离线完整加载上限」，手动调大该值后重新导入。实际额度受可用内存保护限制。\n• 浏览缓存写入失败：在“数据存储”选择有足够空间且可写的本机缓存路径。\n• 文件格式或分卷错误：检查提示中的文件/行号，重新导出数据，或整理成独立文件。\n\n本次未替换当前波形，也不会修改原始文件。"));
     auto settings = message.addButton(QStringLiteral("绘图显示设置…"), QMessageBox::ActionRole);
     settings->setObjectName("offlineAdviceSettings");
     message.addButton(QMessageBox::Close); message.exec();
@@ -73,13 +75,68 @@ void MainWindow::showImportAdvice(const QString &error) {
         dialog.exec();
     }
 }
+double MainWindow::offlineFirstTime() const
+{
+    if (m_pagedData) return m_pagedData->firstTime();
+    return m_importedTimes.isEmpty() ? lastLatestTime : m_importedTimes.constFirst();
+}
+
+void MainWindow::toggleOfflinePlayback()
+{
+    if (m_offlinePlaybackTimer.isActive()) {
+        stopOfflinePlayback();
+        return;
+    }
+    if (!m_isImportedData) return;
+
+    const double first = offlineFirstTime();
+    const double span = m_rangeSlider->upperValue() - m_rangeSlider->lowerValue();
+    if (!(span > 0 && span < lastLatestTime - first)) {
+        statusBar()->showMessage(QStringLiteral("请先用时间滑条选择短于整段数据的窗口，再播放。"), 4500);
+        return;
+    }
+
+    const double upper = m_rangeSlider->upperValue();
+    const double startUpper = upper >= lastLatestTime ? first + span : qMax(first + span, upper);
+    m_offlinePlaybackStart = QCPRange(startUpper - span, startUpper);
+    m_offlinePlaybackClock.start();
+    const int frameInterval = qRound(1000.0 / m_systemPreferences.plotFps);
+    m_offlinePlaybackTimer.start(m_pagedData ? qMax(60, frameInterval) : frameInterval);
+    updateOfflinePlaybackButton();
+    advanceOfflinePlayback();
+}
+
+void MainWindow::advanceOfflinePlayback()
+{
+    // Advance one second on the recording timeline per elapsed second, even
+    // when rendering or reading a disk-backed window delays a timer tick.
+    const double elapsed = m_offlinePlaybackClock.nsecsElapsed() / 1e9;
+    const double upper = qMin(lastLatestTime, m_offlinePlaybackStart.upper + elapsed);
+    applyPlotTimeRange(QCPRange(upper - m_offlinePlaybackStart.size(), upper));
+    if (upper >= lastLatestTime) stopOfflinePlayback();
+    else if (m_pagedData) refreshPagedView();
+}
+
+void MainWindow::stopOfflinePlayback()
+{
+    const bool wasPlaying = m_offlinePlaybackTimer.isActive();
+    m_offlinePlaybackTimer.stop();
+    if (m_offlinePlaybackButton) updateOfflinePlaybackButton();
+    if (wasPlaying && m_pagedData) m_offlineViewTimer.start(0);
+}
+
 void MainWindow::refreshPagedView() {
     m_offlineViewTimer.stop(); if (!m_pagedData || allPlots.isEmpty()) return;
     const auto store = m_pagedData; const auto range = allPlots[0].plot->xAxis->range();
     const qint64 cacheBytes = offlineMemoryBudget();
-    const int maximum = int(qBound<qint64>(128, cacheBytes / (qMax(1, store->channels()) * qint64(sizeof(QCPGraphData)) * 4), 2000000));
+    const int channels = qMax(1, store->channels());
+    int maximum = int(qBound<qint64>(128, cacheBytes / (channels * qint64(sizeof(QCPGraphData)) * 4), 2000000));
+    // While scrolling, limit display work per tick. On pause the regular
+    // display budget returns, and exact measurement reads remain independent.
+    if (m_offlinePlaybackTimer.isActive()) maximum = qMin(maximum, qMax(128, 32768 / channels));
     QVector<QVector<OfflineWaveStore::Point>> curves; QString error; bool exact = false;
     if (!store->display(range.lower, range.upper, maximum, curves, exact, error)) {
+        if (m_offlinePlaybackTimer.isActive()) stopOfflinePlayback();
         statusBar()->showMessage(error + QStringLiteral(" 请重新导入文件，或检查本机缓存路径。"), 10000); return;
     }
     m_pagedViewExact = exact;
@@ -110,6 +167,7 @@ void MainWindow::exportPagedData(const QString &path) {
     QTextStream out(&file); out.setCodec("UTF-8"); out.setGenerateByteOrderMark(true); out << "Time(s)";
     for (int ch = 0; ch < store->channels(); ++ch) out << ',' << RecordingChannels::csvCell(RecordingChannels::name(names, ch)); out << '\n';
     QProgressDialog progress(QStringLiteral("正在读取全部原始采样点并导出……"), QStringLiteral("取消"), 0, 1000, this);
+    progress.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
     progress.setWindowTitle(QStringLiteral("保存数据")); progress.setWindowModality(Qt::WindowModal); progress.setMinimumDuration(500);
     QString error; bool canceled = false;
     const bool ok = store->visit([&](qint64 row, double time, const QVector<double> &values) {

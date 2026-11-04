@@ -12,9 +12,12 @@ struct OfflineFilterSpec {
     double fs = 250, notchHz = 50, highHz = .1, lowHz = 10;
     int order = 2;
     bool active() const { return notch || highpass || lowpass; }
-    bool operator==(const OfflineFilterSpec &b) const {
-        return notch == b.notch && highpass == b.highpass && lowpass == b.lowpass && automaticRate == b.automaticRate && fs == b.fs &&
-            notchHz == b.notchHz && highHz == b.highHz && lowHz == b.lowHz && order == b.order;
+    bool sameResponseAs(const OfflineFilterSpec &other) const {
+        if (notch != other.notch || highpass != other.highpass || lowpass != other.lowpass) return false;
+        return !active() || (fs == other.fs && order == other.order &&
+            (!notch || notchHz == other.notchHz) &&
+            (!highpass || highHz == other.highHz) &&
+            (!lowpass || lowHz == other.lowHz));
     }
 };
 

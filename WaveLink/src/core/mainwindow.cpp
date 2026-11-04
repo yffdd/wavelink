@@ -131,6 +131,8 @@ MainWindow::MainWindow(QWidget *parent, SerialHandler *serialBackend)
     connect(yScaleTimer, &QTimer::timeout, this, &MainWindow::autoScaleY);
     m_offlineViewTimer.setSingleShot(true);
     connect(&m_offlineViewTimer, &QTimer::timeout, this, &MainWindow::refreshPagedView);
+    m_offlinePlaybackTimer.setTimerType(Qt::PreciseTimer);
+    connect(&m_offlinePlaybackTimer, &QTimer::timeout, this, &MainWindow::advanceOfflinePlayback);
     setupUi();
     qApp->installEventFilter(this);
     
@@ -395,9 +397,11 @@ void MainWindow::setupUi()
     
     QPushButton *btnLeft = new QPushButton("<", this);
     btnLeft->setFixedWidth(30);
+    btnLeft->setToolTip(QStringLiteral("按设定步长向左移动时间窗口"));
     
     QPushButton *btnRight = new QPushButton(">", this);
     btnRight->setFixedWidth(30);
+    btnRight->setToolTip(QStringLiteral("按设定步长向右移动时间窗口"));
     auto btnTimeLatest = new QPushButton(">>", this);
     btnTimeLatest->setObjectName("btnTimeScrollToLatest"); btnTimeLatest->setFixedWidth(40);
     btnTimeLatest->setToolTip("跳转至最新时刻（恢复自动跟随波形）");
@@ -430,8 +434,23 @@ void MainWindow::setupUi()
         }
     });
 
+    m_offlinePlaybackButton = new QPushButton(this);
+    m_offlinePlaybackButton->setObjectName("btnOfflinePlayback");
+    m_offlinePlaybackButton->setFixedWidth(30);
+    m_offlinePlaybackButton->setIconSize(QSize(14, 14));
+    m_offlinePlaybackButton->setCursor(Qt::PointingHandCursor);
+    m_offlinePlaybackButton->setStyleSheet(
+        "QPushButton { background-color: #216693; border: 1px solid #185078; padding: 4px; }"
+        "QPushButton:hover { background-color: #2878a9; }"
+        "QPushButton:pressed { background-color: #174b6c; }"
+        "QPushButton:focus { border-color: #78b8e0; }"
+        "QPushButton:disabled { background-color: #626970; border-color: #555c62; }");
+    connect(m_offlinePlaybackButton, &QPushButton::clicked, this, &MainWindow::toggleOfflinePlayback);
+    updateOfflinePlaybackButton();
+
     sliderLayout->addWidget(spinStep);
     sliderLayout->addSpacing(5);
+    sliderLayout->addWidget(m_offlinePlaybackButton);
     sliderLayout->addWidget(btnLeft);
     sliderLayout->addSpacing(15);
     sliderLayout->addWidget(m_rangeSlider, 1);
@@ -462,6 +481,20 @@ void MainWindow::setupUi()
     
     // 3. Setup Menu Bar & Status Bar
     setupMenuAndStatusBar();
+}
+
+void MainWindow::updateOfflinePlaybackButton()
+{
+    static const QIcon playIcon = plotPlaybackIcon(true);
+    static const QIcon pauseIcon = plotPlaybackIcon(false);
+    const bool playing = m_offlinePlaybackTimer.isActive();
+    const bool available = m_isImportedData && lastLatestTime > offlineFirstTime();
+    m_offlinePlaybackButton->setEnabled(available);
+    m_offlinePlaybackButton->setIcon(playing ? pauseIcon : playIcon);
+    m_offlinePlaybackButton->setAccessibleName(playing ? QStringLiteral("暂停离线播放") : QStringLiteral("播放离线波形"));
+    m_offlinePlaybackButton->setToolTip(playing ? QStringLiteral("暂停离线播放")
+        : available ? QStringLiteral("播放离线波形（1 倍速）。请用时间滑条选择短于整段数据的窗口。")
+                    : QStringLiteral("导入包含时间跨度的波形后可播放。"));
 }
 
 void MainWindow::setupMenuAndStatusBar()
@@ -1086,6 +1119,8 @@ void MainWindow::setupDockWidgets()
     QFormLayout *plotLayout = new QFormLayout(groupPlot);
     
     spinFs = new QDoubleSpinBox();
+    spinFs->setObjectName("spinFs");
+    spinFs->setKeyboardTracking(false);
     spinFs->setRange(1.0, 100000.0);
     spinFs->setValue(settings.value("Fs", 250.0).toDouble());
     spinFs->setSuffix(" Hz");
@@ -2157,6 +2192,8 @@ void MainWindow::setupDockWidgets()
     QHBoxLayout *notchLayout = new QHBoxLayout();
     chkNotch = new QCheckBox("陷波（工频干扰）");
     spinNotchFreq = new QDoubleSpinBox();
+    spinNotchFreq->setObjectName("spinNotchFreq");
+    spinNotchFreq->setKeyboardTracking(false);
     spinNotchFreq->setRange(1.0, 1000.0);
     spinNotchFreq->setValue(50.0);
     spinNotchFreq->setSuffix(" Hz");
@@ -2168,6 +2205,8 @@ void MainWindow::setupDockWidgets()
     QHBoxLayout *hpfLayout = new QHBoxLayout();
     chkHPF = new QCheckBox("高通（基线漂移）");
     spinHPFFreq = new QDoubleSpinBox();
+    spinHPFFreq->setObjectName("spinHPFFreq");
+    spinHPFFreq->setKeyboardTracking(false);
     spinHPFFreq->setRange(0.01, 1000.0);
     spinHPFFreq->setValue(0.1);
     spinHPFFreq->setSuffix(" Hz");
@@ -2179,6 +2218,8 @@ void MainWindow::setupDockWidgets()
     QHBoxLayout *lpfLayout = new QHBoxLayout();
     chkLPF = new QCheckBox("低通（高频噪声）");
     spinLPFFreq = new QDoubleSpinBox();
+    spinLPFFreq->setObjectName("spinLPFFreq");
+    spinLPFFreq->setKeyboardTracking(false);
     spinLPFFreq->setRange(1.0, 10000.0);
     spinLPFFreq->setValue(10.0);
     spinLPFFreq->setSuffix(" Hz");

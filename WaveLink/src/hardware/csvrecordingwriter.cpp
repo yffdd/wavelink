@@ -208,7 +208,8 @@ bool CsvRecordingWriter::finish(QString &error)
     return ok;
 }
 
-bool CsvRecordingWriter::exportToCsv(const QStringList &files, QIODevice *destination, QString &error)
+bool CsvRecordingWriter::exportToCsv(const QStringList &files, QIODevice *destination, QString &error,
+                                    const std::function<void(qint64, qint64)> &progress)
 {
     error.clear();
     if (files.isEmpty() || !destination || !destination->isWritable()) {
@@ -220,9 +221,11 @@ bool CsvRecordingWriter::exportToCsv(const QStringList &files, QIODevice *destin
     // parts are a prefix-compatible column family; missing channels become
     // NaN, never zero or a renamed/shifted measurement.
     QVector<int> columns; QStringList widest; QByteArray outputHeader;
+    qint64 totalBytes = 0;
     for (const auto &path : files) {
         QFile file(path);
         if (!file.open(QIODevice::ReadOnly)) { error = QStringLiteral("无法读取 CSV 录制文件：%1\n%2").arg(path, file.errorString()); return false; }
+        if (progress) totalBytes += file.size();
         QByteArray header = file.readLine(256 * 1024);
         if (!header.endsWith('\n')) { error = "CSV 表头缺失或过长，不能合并。"; return false; }
         if (header.startsWith(bom)) header.remove(0, bom.size());
@@ -238,6 +241,7 @@ bool CsvRecordingWriter::exportToCsv(const QStringList &files, QIODevice *destin
         return false;
     }
     if (destination->write(outputHeader) != outputHeader.size()) { error = "写入 CSV 表头失败。"; return false; }
+    qint64 completedBytes = 0;
     for (int i = 0; i < files.size(); ++i) {
         QFile source(files[i]);
         if (!source.open(QIODevice::ReadOnly)) {
@@ -255,24 +259,29 @@ bool CsvRecordingWriter::exportToCsv(const QStringList &files, QIODevice *destin
                 for (int missing = columns[i]; missing < widest.size(); ++missing) line += ",nan";
                 line += '\n';
                 if (destination->write(line) != line.size()) { error = "写入 CSV 导出文件失败。"; return false; }
+                if (progress) progress(completedBytes + source.pos(), totalBytes);
             }
-            if (source.error() != QFile::NoError) { error = source.errorString(); return false; }
-            continue;
-        }
-        while (!source.atEnd()) {
-            const auto chunk = source.read(1024 * 1024);
-            if (chunk.isEmpty() && source.error() != QFile::NoError) {
-                error = QStringLiteral("读取 CSV 录制文件失败：%1\n%2").arg(files[i], source.errorString());
-                return false;
-            }
-            if (destination->write(chunk) != chunk.size()) {
-                error = QStringLiteral("写入 CSV 导出文件失败。");
-                return false;
+        } else {
+            while (!source.atEnd()) {
+                const auto chunk = source.read(1024 * 1024);
+                if (chunk.isEmpty() && source.error() != QFile::NoError) {
+                    error = QStringLiteral("读取 CSV 录制文件失败：%1\n%2").arg(files[i], source.errorString());
+                    return false;
+                }
+                if (destination->write(chunk) != chunk.size()) {
+                    error = QStringLiteral("写入 CSV 导出文件失败。");
+                    return false;
+                }
+                if (progress) progress(completedBytes + source.pos(), totalBytes);
             }
         }
         if (source.error() != QFile::NoError) {
             error = QStringLiteral("读取 CSV 录制文件失败：%1\n%2").arg(files[i], source.errorString());
             return false;
+        }
+        if (progress) {
+            completedBytes += source.size();
+            progress(completedBytes, totalBytes);
         }
     }
     return true;

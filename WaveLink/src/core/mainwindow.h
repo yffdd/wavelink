@@ -31,6 +31,7 @@
 #include "ProtocolParser.h"
 #include "ProtocolProfileStore.h"
 #include <memory>
+#include <optional>
 #include "qcustomplot.h"
 #include "ffthelper.h"
 #include "filter.h"
@@ -427,8 +428,17 @@ private:
     QVector<double> m_importedTimes;
     QVector<QVector<double>> m_importedData;
     QSharedPointer<OfflineWaveStore> m_pagedRaw, m_pagedData;
-    OfflineFilterSpec m_pagedFilterSpec;
+    std::optional<OfflineFilterSpec> m_appliedOfflineFilter;
     QTimer m_offlineViewTimer;
+    QPushButton *m_offlinePlaybackButton = nullptr;
+    QTimer m_offlinePlaybackTimer;
+    QElapsedTimer m_offlinePlaybackClock;
+    QCPRange m_offlinePlaybackStart;
+    double offlineFirstTime() const;
+    void toggleOfflinePlayback();
+    void advanceOfflinePlayback();
+    void stopOfflinePlayback();
+    void updateOfflinePlaybackButton();
     bool m_pagedViewExact = false;
     void refreshPagedView();
     qint64 offlineMemoryBudget() const;
@@ -612,6 +622,7 @@ private:
     void onExportCache();
     void autoScaleY();
     void syncTimeRangeSlider(const QCPRange &viewRange);
+    void applyPlotTimeRange(const QCPRange &viewRange);
     void enforcePlotHistoryLimit(bool updateUsageLabel = true);
     void onPlotDockClosedEvent(class QDockWidget *dock);
     

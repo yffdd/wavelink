@@ -59,11 +59,18 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QStorageInfo>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <limits>
 
 namespace {
+class RecordingSaveDialog final : public QDialog {
+public:
+    using QDialog::QDialog;
+    void reject() override {} // Keep the progress visible until the file is finalized.
+};
+
 bool rebuildUniformTimeline(QVector<double> &times, double sampleRateHint)
 {
     if (times.size() < 2) return false;
@@ -540,7 +547,9 @@ void MainWindow::onToggleRecord()
     } else {
         stopRecordingSafely();
     }
-}void MainWindow::onExportData()
+}
+
+void MainWindow::onExportData()
 {
     if (isRecording || m_bleRecordStopPending) {
         QMessageBox::warning(this, QString::fromUtf8("警告"), QString::fromUtf8("当前正在录制或完成文件收尾，请等待录制完全停止后再保存。"));
@@ -554,50 +563,85 @@ void MainWindow::onToggleRecord()
     QString lastDir = settings.value("LastDataDir", QDir::homePath()).toString();
     QString defaultName = QDir(lastDir).filePath(QString("WaveData_%1.csv").arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")));
     QString destPath = QFileDialog::getSaveFileName(this, "导出数据", defaultName, "CSV Files (*.csv)");
-    if (!destPath.isEmpty()) {
-        settings.setValue("LastDataDir", QFileInfo(destPath).absolutePath());
-        const QString sourcePath = QFileInfo(currentRecordFile).canonicalFilePath();
-        const QString selectedPath = QFileInfo(destPath).canonicalFilePath();
-        if (!sourcePath.isEmpty() && !selectedPath.isEmpty() && sourcePath == selectedPath) {
-            QMessageBox::warning(this, "导出失败", "目标文件不能与当前录制缓存文件相同。");
+    if (destPath.isEmpty()) return;
+    settings.setValue("LastDataDir", QFileInfo(destPath).absolutePath());
+
+    QFileInfo baseInfo(currentRecordFile);
+    QString baseStem = baseInfo.completeBaseName();
+    baseStem.remove(QRegularExpression(QStringLiteral("_part\\d{3,}$")));
+    const QString sourceSuffix = baseInfo.suffix().toLower();
+    const QString normalizedBase = baseInfo.dir().absoluteFilePath(baseStem + '.' + baseInfo.suffix());
+    if (QFile::exists(normalizedBase)) baseInfo.setFile(normalizedBase);
+    QStringList sourceFiles;
+    if (baseInfo.exists()) sourceFiles.append(baseInfo.absoluteFilePath());
+    const auto parts = RecordingChannels::recordingParts(baseInfo);
+    for (const auto &part : parts) sourceFiles.append(part.absoluteFilePath());
+
+    const QString selectedPath = QFileInfo(destPath).canonicalFilePath();
+    for (const auto &source : sourceFiles) {
+        if (!selectedPath.isEmpty() && QFileInfo(source).canonicalFilePath() == selectedPath) {
+            QMessageBox::warning(this, "导出失败", "目标文件不能覆盖录制缓存的任意分卷，请选择其他文件名。");
             return;
         }
+    }
+    if (sourceFiles.isEmpty()) {
+        QMessageBox::warning(this, "导出失败", "找不到录制缓存文件。");
+        return;
+    }
 
-        QFileInfo baseInfo(currentRecordFile);
-        QString baseStem = baseInfo.completeBaseName();
-        baseStem.remove(QRegularExpression(QStringLiteral("_part\\d{3}$")));
-        const QString sourceSuffix = baseInfo.suffix().toLower();
-        const QString normalizedBase = baseInfo.dir().absoluteFilePath(
-            baseStem + QStringLiteral(".") + sourceSuffix);
-        if (QFile::exists(normalizedBase)) baseInfo.setFile(normalizedBase);
-        QStringList sourceFiles;
-        if (baseInfo.exists()) sourceFiles.append(baseInfo.absoluteFilePath());
-        const QFileInfoList extraParts = RecordingChannels::recordingParts(baseInfo);
-        for (const QFileInfo &part : extraParts) sourceFiles.append(part.absoluteFilePath());
-        for (const auto &source : sourceFiles) if (!selectedPath.isEmpty() && QFileInfo(source).canonicalFilePath() == selectedPath) {
-            QMessageBox::warning(this, "导出失败", "目标文件不能覆盖录制缓存的任意分卷，请选择其他文件名。"); return;
-        }
+    RecordingSaveDialog dialog(this);
+    dialog.setObjectName("recordingSaveProgress");
+    dialog.setWindowTitle(QStringLiteral("保存数据"));
+    dialog.setWindowModality(Qt::WindowModal);
+    dialog.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+    dialog.setWindowFlag(Qt::WindowCloseButtonHint, false);
+    dialog.setMinimumWidth(360);
+    auto layout = new QVBoxLayout(&dialog);
+    auto label = new QLabel(QStringLiteral("正在将录制数据保存为 CSV…"), &dialog);
+    auto bar = new QProgressBar(&dialog);
+    bar->setValue(0);
+    layout->addWidget(label);
+    layout->addWidget(bar);
 
+    std::atomic<int> percent{0};
+    QTimer refresh;
+    connect(&refresh, &QTimer::timeout, &dialog, [&] {
+        const int value = percent.load(std::memory_order_relaxed);
+        bar->setValue(value);
+        if (value == 99) label->setText(QStringLiteral("正在完成文件写入…"));
+    });
+    QFutureWatcher<QString> watcher;
+    connect(&watcher, &QFutureWatcher<QString>::finished, &dialog, &QDialog::accept);
+    watcher.setFuture(QtConcurrent::run([sourceFiles, sourceSuffix, destPath, &percent]() -> QString {
         QSaveFile destination(destPath);
-        bool copied = !sourceFiles.isEmpty() && destination.open(QIODevice::WriteOnly);
-        QString conversionError;
-        if (copied && sourceSuffix == QStringLiteral("wlr")) {
-            copied = WlrRecordingWriter::exportToCsv(
-                sourceFiles, &destination, conversionError);
-        } else {
-            if (copied) copied = CsvRecordingWriter::exportToCsv(sourceFiles, &destination, conversionError);
-        }
-        if (copied) copied = destination.commit();
-        else destination.cancelWriting();
+        if (!destination.open(QIODevice::WriteOnly))
+            return QStringLiteral("无法创建目标文件。\n%1").arg(destination.errorString());
 
-        if (copied) {
-            QMessageBox::information(this, "导出成功", QString("文件已成功保存至:\n%1").arg(destPath));
-        } else {
-            QMessageBox::warning(this, "导出失败",
-                                 conversionError.isEmpty()
-                                     ? QStringLiteral("文件转换或复制失败，请检查路径权限或文件是否被占用")
-                                     : conversionError);
-        }
+        const auto report = [&percent](qint64 bytes, qint64 total) {
+            percent.store(qBound(0, int(100.0 * bytes / qMax<qint64>(1, total)), 99),
+                          std::memory_order_relaxed);
+        };
+        QString error;
+        const bool converted = sourceSuffix == QStringLiteral("wlr")
+            ? WlrRecordingWriter::exportToCsv(sourceFiles, &destination, error, report)
+            : CsvRecordingWriter::exportToCsv(sourceFiles, &destination, error, report);
+        if (!converted) return error.isEmpty() ? QStringLiteral("文件转换或复制失败。") : error;
+
+        percent.store(99, std::memory_order_relaxed);
+        if (!destination.commit())
+            return QStringLiteral("无法完成文件写入。\n%1").arg(destination.errorString());
+        return {};
+    }));
+    refresh.start(80);
+    dialog.exec();
+    refresh.stop();
+    watcher.waitForFinished();
+
+    const QString error = watcher.result();
+    if (error.isEmpty()) {
+        QMessageBox::information(this, "导出成功", QString("文件已成功保存至\n%1").arg(destPath));
+    } else {
+        QMessageBox::warning(this, "导出失败", error + QStringLiteral("\n原目标文件未被覆盖。"));
     }
 }
 void MainWindow::onImportData()
@@ -606,6 +650,7 @@ void MainWindow::onImportData()
         QMessageBox::warning(this, QString::fromUtf8("警告"), QString::fromUtf8("当前设备已连接并在接收数据。\n为了避免波形显示冲突，请先断开连接后再导入历史数据。"));
         return;
     }
+    stopOfflinePlayback();
     
     QSettings settings("WaveLink", "AdvancedApp");
     QString lastDir = settings.value("LastDataDir", QDir::homePath()).toString();
@@ -635,6 +680,7 @@ void MainWindow::onImportData()
 
     QProgressDialog progress(QString::fromUtf8("正在导入数据..."), QString::fromUtf8("取消"),
                              0, 1000, this);
+    progress.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
     progress.setWindowTitle(QString::fromUtf8("导入数据"));
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(500);
@@ -872,7 +918,6 @@ void MainWindow::onImportData()
     clearProtocolPlots();
     m_isImportedData = true;
     m_importedChannelNames = RecordingChannels::normalized(importedNames, numCh);
-    m_pagedRaw = pendingStore; m_pagedData = filteredStore; m_pagedFilterSpec = importedFilter;
     
     if (validRows >= 2) {
         double avgInterval = (importedLast - importedFirst) / (validRows - 1);
@@ -890,6 +935,8 @@ void MainWindow::onImportData()
     }
     // Create channels if needed
     checkAndAddChannel(numCh);
+    m_pagedRaw = pendingStore; m_pagedData = filteredStore;
+    if (pendingStore) m_appliedOfflineFilter = importedFilter;
     m_importedTimes = times;
     m_importedData = chData;
     
@@ -907,8 +954,8 @@ void MainWindow::onImportData()
             ctx.plot->xAxis->blockSignals(false);
             if (ctx.widthText) ctx.widthText->setText(QString("X跨度: %1 s").arg(fullRange.size(), 0, 'f', 2));
         }
-        resetFilters(); // Fill the complete in-memory data or the current disk-backed window.
-        autoScaleY();
+        resetFilters();
+        if (m_pagedData) refreshPagedView();
         // Refresh Y-span text after import
         int decimals = spinDecimals ? spinDecimals->value() : 2;
         for (PlotContext &ctx : allPlots) {
@@ -918,10 +965,15 @@ void MainWindow::onImportData()
         }
     }
     if (!allPlots.isEmpty()) syncTimeRangeSlider(allPlots[0].plot->xAxis->range());
-    QMessageBox::information(this, QString::fromUtf8("导入成功"),
-        QString::fromUtf8("成功导入 %1 个通道，共 %2 行采样数据。\n%3").arg(numCh).arg(validRows).arg(pendingStore
-            ? QStringLiteral("文件超过完整加载额度，已自动按需浏览，全部数据仍可查看。概览保留峰谷，放大后读取原始采样点；测量和导出使用原始数据。\n如希望扩大完整加载或精细浏览额度，可在“系统设置 → 绘图显示 → 离线完整加载上限”调整后重新导入。临时缓存位于本机缓存路径，关闭数据后自动清理。")
-            : QStringLiteral("离线波形完整保留，不受实时历史上限裁剪。")));
+    updateOfflinePlaybackButton();
+    const QString details = pendingStore
+        ? QStringLiteral("当前完整加载额度为 %1 MB，已切换到按需浏览。全部采样数据均已保留，缩小时显示峰谷概览，放大后可查看原始采样点。\n\n"
+                         "如需将全部采样点一次加载到内存，请前往「设置 → 系统设置 → 绘图显示 → 离线完整加载上限」，手动调大该值后重新导入。"
+                         "实际额度还受可用内存保护限制。")
+              .arg(importBudgetBytes / (1024.0 * 1024.0), 0, 'f', 1)
+        : QStringLiteral("离线波形完整保留，不受实时历史上限裁剪。");
+    QMessageBox::information(this, QStringLiteral("导入成功"),
+        QStringLiteral("成功导入 %1 个通道，共 %2 行采样数据。\n\n%3").arg(numCh).arg(validRows).arg(details));
 }
 void MainWindow::onRecordTimer()
 {
@@ -959,6 +1011,8 @@ void MainWindow::onRecordTimer()
 }
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    stopOfflinePlayback();
+    m_offlineViewTimer.stop();
     stopConsolePeriodicSend();
     if (bleClient) bleClient->disconnectDevice();
     if (isRecording) stopRecordingSafely();
@@ -1038,6 +1092,7 @@ void MainWindow::onExportCache()
     out << header << "\n";
 
     QProgressDialog progress(QString::fromUtf8("正在保存数据..."), QString::fromUtf8("取消"), 0, maxPoints, this);
+    progress.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
     progress.setWindowTitle(QString::fromUtf8("保存数据"));
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(500);

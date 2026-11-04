@@ -7,6 +7,7 @@
 #include <QStringList>
 #include <QVector>
 #include <QLockFile>
+#include <functional>
 #include <memory>
 
 // Crash-safe, size-limited CSV recorder shared by serial, network and Demo.
@@ -31,7 +32,8 @@ public:
 
     // Export legacy or new UTF-8 parts to an empty destination, with one BOM
     // and one header. Source recordings are read-only and remain unchanged.
-    static bool exportToCsv(const QStringList &files, QIODevice *destination, QString &error);
+    static bool exportToCsv(const QStringList &files, QIODevice *destination, QString &error,
+                            const std::function<void(qint64, qint64)> &progress = {});
 
     static QStringList recoverInterruptedFiles(const QString &directory,
                                                QStringList &errors);

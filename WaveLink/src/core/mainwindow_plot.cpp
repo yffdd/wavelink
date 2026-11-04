@@ -1104,6 +1104,7 @@ void MainWindow::updateChannelSelectionSummary()
 }
 void MainWindow::scrollToLatest()
 {
+    stopOfflinePlayback();
     m_autoScroll = true;
     for (PlotContext &ctx : allPlots) {
         const double rangeSize = ctx.plot->xAxis->range().size();
@@ -1120,18 +1121,21 @@ void MainWindow::syncTimeRangeSlider(const QCPRange &viewRange)
     // Clamping either case to 0..1 (or to a short recording) made Range lie
     // about the actual X span and the next drag unexpectedly shrink the view.
     const QSignalBlocker blocker(m_rangeSlider);
-    m_rangeSlider->setRange(qMin(0.0, viewRange.lower), qMax(lastLatestTime, viewRange.upper));
+    const double firstTime = m_isImportedData ? qMin(0.0, offlineFirstTime()) : 0.0;
+    m_rangeSlider->setRange(qMin(firstTime, viewRange.lower), qMax(lastLatestTime, viewRange.upper));
     m_rangeSlider->setRelativeOffset(isPortOpen ? lastLatestTime : 0.0);
     m_rangeSlider->setValues(viewRange.lower, viewRange.upper);
 }
 void MainWindow::onXAxisRangeChanged(const QCPRange &newRange)
 {
+    if (m_offlinePlaybackTimer.isActive()) stopOfflinePlayback();
     QCPRange clampedRange = newRange;
     if (newRange.upper > lastLatestTime) {
         clampedRange = QCPRange(lastLatestTime - newRange.size(), lastLatestTime);
     }
-    if (clampedRange.lower < 0) {
-        clampedRange = QCPRange(0, clampedRange.size());
+    const double firstTime = m_isImportedData ? qMin(0.0, offlineFirstTime()) : 0.0;
+    if (clampedRange.lower < firstTime) {
+        clampedRange = QCPRange(firstTime, firstTime + clampedRange.size());
     }
 
     if (clampedRange.upper >= lastLatestTime - 1e-2) {
@@ -1140,17 +1144,22 @@ void MainWindow::onXAxisRangeChanged(const QCPRange &newRange)
         m_autoScroll = false;
     }
     
-    syncTimeRangeSlider(clampedRange);
-    if (m_pagedData) m_offlineViewTimer.start(60);
+    applyPlotTimeRange(clampedRange);
+}
+
+void MainWindow::applyPlotTimeRange(const QCPRange &viewRange)
+{
+    syncTimeRangeSlider(viewRange);
+    if (m_pagedData && !m_offlinePlaybackTimer.isActive()) m_offlineViewTimer.start(60);
     
     // Sync all plots
     for (PlotContext &ctx : allPlots) {
         if (ctx.widthText) {
-            ctx.widthText->setText(QString("X跨度: %1 s").arg(clampedRange.size(), 0, 'f', 2));
+            ctx.widthText->setText(QString("X跨度: %1 s").arg(viewRange.size(), 0, 'f', 2));
         }
-        if (ctx.plot->xAxis->range() != clampedRange) {
+        if (ctx.plot->xAxis->range() != viewRange) {
             ctx.plot->xAxis->blockSignals(true);
-            ctx.plot->xAxis->setRange(clampedRange);
+            ctx.plot->xAxis->setRange(viewRange);
             ctx.plot->xAxis->blockSignals(false);
             ctx.plot->replot(QCustomPlot::rpQueuedReplot);
         }
@@ -1653,8 +1662,10 @@ void MainWindow::leaveImportedDataMode()
     for (const auto &context : allPlots) for (int ch = 0; ch < context.plot->graphCount(); ++ch)
         if (auto graph = dynamic_cast<WaveformGraph *>(context.plot->graph(ch))) graph->clearOfflineSource();
     m_pagedData.clear(); m_pagedRaw.clear();
+    m_appliedOfflineFilter.reset();
     const bool hadImportedNames = m_isImportedData;
     m_isImportedData = false;
+    stopOfflinePlayback();
     m_importedChannelNames.clear();
     m_importedTimes.clear();
     m_importedData.clear();

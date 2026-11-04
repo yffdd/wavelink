@@ -26,6 +26,16 @@ int main(int argc, char **argv)
     QTemporaryDir dir;
     if (!require(dir.isValid(), QStringLiteral("temporary directory unavailable"))) return 1;
 
+    qint64 progressBytes = 0;
+    qint64 progressTotal = 0;
+    bool validProgress = true;
+    const auto reportProgress = [&](qint64 bytes, qint64 total) {
+        validProgress = validProgress && bytes >= progressBytes && bytes <= total &&
+            (progressTotal == 0 || progressTotal == total);
+        progressBytes = bytes;
+        progressTotal = total;
+    };
+
     {
         WlrRecordingWriter timed;
         QString error;
@@ -130,7 +140,9 @@ int main(int argc, char **argv)
     QByteArray exportedCsv;
     QBuffer csvBuffer(&exportedCsv);
     csvBuffer.open(QIODevice::WriteOnly);
-    if (!require(WlrRecordingWriter::exportToCsv(wlrParts, &csvBuffer, wlrError), wlrError)) return 23;
+    if (!require(WlrRecordingWriter::exportToCsv(wlrParts, &csvBuffer, wlrError, reportProgress), wlrError)) return 23;
+    if (!require(validProgress && progressBytes > 0 && progressBytes == progressTotal,
+                 "WLR export progress must cover both passes and reach the total")) return 105;
     if (!require(exportedCsv.startsWith(bom + "UnixTime(s;FS=100),SampleIndex,Ch1,Ch2\n") && exportedCsv.count(bom) == 1,
                  QStringLiteral("WLR CSV conversion failed"))) return 24;
     if (!require(exportedCsv.contains("1700000000.000000000,1,1.000000,2.000000\n"),
@@ -193,7 +205,10 @@ int main(int argc, char **argv)
     // Merge independently usable parts without interior BOMs or repeated
     // headers. Preserve every data line and all names exactly as recorded.
     QByteArray merged; QBuffer mergedBuffer(&merged); mergedBuffer.open(QIODevice::WriteOnly);
-    if (!require(CsvRecordingWriter::exportToCsv(namedCsv.completedFiles(), &mergedBuffer, namedError), namedError)) return 55;
+    progressBytes = progressTotal = 0;
+    if (!require(CsvRecordingWriter::exportToCsv(namedCsv.completedFiles(), &mergedBuffer, namedError, reportProgress), namedError)) return 55;
+    if (!require(validProgress && progressBytes > 0 && progressBytes == progressTotal,
+                 "CSV export progress must cover every recording part")) return 106;
     if (!require(merged.startsWith(bom) && merged.count(bom) == 1 && merged.count("UnixTime") == 1 && merged.count('\n') == 9,
                  "merged CSV one BOM/header and all eight frames")) return 56;
     QBuffer mergedInput; mergedInput.setData(merged); mergedInput.open(QIODevice::ReadOnly); QTextStream mergedStream(&mergedInput); mergedStream.setCodec("UTF-8");

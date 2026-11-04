@@ -401,23 +401,10 @@ void MainWindow::updateFilterNyquistLimits() {
     double nyquistMax = (fs / 2.0) - 0.1;
     if (nyquistMax < 0.1) nyquistMax = 0.1;
 
-    if (spinNotchFreq) {
-        spinNotchFreq->blockSignals(true);
-        spinNotchFreq->setMaximum(nyquistMax);
-        if (spinNotchFreq->value() > nyquistMax) spinNotchFreq->setValue(nyquistMax);
-        spinNotchFreq->blockSignals(false);
-    }
-    if (spinHPFFreq) {
-        spinHPFFreq->blockSignals(true);
-        spinHPFFreq->setMaximum(nyquistMax);
-        if (spinHPFFreq->value() > nyquistMax) spinHPFFreq->setValue(nyquistMax);
-        spinHPFFreq->blockSignals(false);
-    }
-    if (spinLPFFreq) {
-        spinLPFFreq->blockSignals(true);
-        spinLPFFreq->setMaximum(nyquistMax);
-        if (spinLPFFreq->value() > nyquistMax) spinLPFFreq->setValue(nyquistMax);
-        spinLPFFreq->blockSignals(false);
+    for (auto spin : {spinNotchFreq, spinHPFFreq, spinLPFFreq}) {
+        if (!spin) continue;
+        const QSignalBlocker blocker(spin);
+        spin->setMaximum(nyquistMax);
     }
 }
 
@@ -535,59 +522,60 @@ void MainWindow::applyFilters(QVector<double> &data) {
 }
 
 void MainWindow::reapplyFiltersToImportedData() {
-    if (m_isImportedData && m_pagedRaw) {
-        const auto spec = offlineFilterSpec();
-        if (!(spec == m_pagedFilterSpec)) {
-            bool canceled = false; QString error;
-            const auto filtered = filterOfflineStore(m_pagedRaw, spec, canceled, error);
-            if (!filtered) {
-                restoreOfflineFilters(m_pagedFilterSpec);
-                if (!canceled) showImportAdvice(error);
-                return;
-            }
-            m_pagedData = filtered; m_pagedFilterSpec = spec;
-            for (auto &context : allPlots) {
-                context.measureState = 0;
-                for (auto tracer : {context.tracer1, context.tracer2, context.hoverTracer}) tracer->setVisible(false);
-                context.measureLine->setVisible(false);
-                for (auto text : {context.measureText, context.measureText2, context.measureDeltaText, context.hoverText}) text->setVisible(false);
-            }
-        }
-        refreshPagedView(); return;
+    if (!m_pagedRaw && (m_importedTimes.isEmpty() || m_importedData.isEmpty())) return;
+
+    const auto spec = offlineFilterSpec();
+    if (m_appliedOfflineFilter && spec.sameResponseAs(*m_appliedOfflineFilter)) {
+        m_appliedOfflineFilter = spec;
+        return;
     }
-    if (!m_isImportedData || m_importedTimes.isEmpty() || m_importedData.isEmpty()) return;
-    
-    int numCh = m_importedData.size();
-    int numSamples = m_importedTimes.size();
-    
-    QVector<QVector<double>> filteredData = m_importedData;
-    
-    
-    // Process chronologically frame by frame
-    for (int j = 0; j < numSamples; ++j) {
-        QVector<double> frame(numCh);
-        for (int i = 0; i < numCh; ++i) {
-            frame[i] = m_importedData[i][j];
+
+    if (m_pagedRaw) {
+        const auto raw = m_pagedRaw;
+        bool canceled = false;
+        QString error;
+        const auto filtered = filterOfflineStore(raw, spec, canceled, error);
+        if (m_pagedRaw != raw) return;
+        if (!filtered) {
+            restoreOfflineFilters(*m_appliedOfflineFilter);
+            if (!canceled) showImportAdvice(error);
+            return;
         }
-        applyFilters(frame);
-        for (int i = 0; i < numCh; ++i) {
-            filteredData[i][j] = frame[i];
+        m_pagedData = filtered;
+        m_appliedOfflineFilter = spec;
+        for (auto &context : allPlots) {
+            context.measureState = 0;
+            for (auto tracer : {context.tracer1, context.tracer2, context.hoverTracer}) tracer->setVisible(false);
+            context.measureLine->setVisible(false);
+            for (auto text : {context.measureText, context.measureText2, context.measureDeltaText, context.hoverText}) text->setVisible(false);
+        }
+        refreshPagedView();
+        return;
+    }
+
+    // Each channel has independent filter state. Build its plotted samples
+    // directly, in chronological order, and share them across its views.
+    const auto times = m_importedTimes.constData();
+    for (int channel = 0; channel < qMin(m_importedData.size(), channelGraphs.size()); ++channel) {
+        const auto &raw = m_importedData.at(channel);
+        const auto values = raw.constData();
+        auto &filters = filterStates[channel];
+        QVector<QCPGraphData> points(raw.size());
+        auto output = points.data();
+        for (int i = 0; i < raw.size(); ++i) {
+            double value = values[i];
+            if (spec.notch) value = filters.notch.process(value);
+            if (spec.highpass) value = filters.hpf.process(value);
+            if (spec.lowpass) value = filters.lpf.process(value);
+            output[i] = QCPGraphData(times[i], value);
+        }
+        channelGraphs[channel]->data()->set(points, true);
+        for (int view = 1; view < allPlots.size(); ++view) {
+            if (auto graph = WaveformGraph::forChannel(allPlots[view].plot, channel))
+                graph->data()->set(points, true);
         }
     }
-    
-    // Feed filtered data back to graphs
-    for (int i = 0; i < numCh && i < channelGraphs.size(); ++i) {
-        channelGraphs[i]->setData(m_importedTimes, filteredData[i], true);
-        if (channelToPlotMap.value(i, 0) > 0) {
-            int plotIdx = channelToPlotMap[i];
-            if (plotIdx < allPlots.size() && allPlots[plotIdx].plot->graphCount() > 0) {
-                auto sepGraph = WaveformGraph::forChannel(allPlots[plotIdx].plot, i);
-                if (sepGraph) {
-                    sepGraph->setData(m_importedTimes, filteredData[i], true);
-                }
-            }
-        }
-    }
+    m_appliedOfflineFilter = spec;
     enforcePlotHistoryLimit(true);
     
     // Trigger redraw

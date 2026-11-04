@@ -208,14 +208,10 @@ void MainWindow::onOpenCloseConnection()
     qDebug() << "onOpenCloseConnection START, isPortOpen:" << isPortOpen;
     if (!isPortOpen) {
         // Every new connection starts from raw data, never from a previous filter state.
-        clearFilterSelections();
+        if (!m_isImportedData) clearFilterSelections();
 
-        // Reconnecting must not clear the existing waveform. The explicit
-        // "清空波形" action remains the only operation that clears plots.
-        // Channel structures are kept so new samples continue on the current
-        // view; syncChannelCount() will reconcile a changed channel count when
-        // the first new frame arrives.
-        qDebug() << "onOpenClosePort: preserving existing plots for reconnect";
+        // Keep live history across reconnects. Imported history is cleared
+        // once the new connection succeeds.
         int interfaceType = comboInterface->currentData().toInt();
         bool success = false;
 
@@ -387,9 +383,12 @@ void MainWindow::handleRecordingError(const QString &errorMsg)
 void MainWindow::finishConnectionOpen(int interfaceType)
 {
     m_receiveDecoder.reset(); m_receiveDecoderEncoding.clear();
-    // Keep displayed history, but never re-filter old imported vectors over
-    // newly received live data or continue using imported channel names.
-    leaveImportedDataMode();
+    if (m_isImportedData) {
+        onClearPlots();
+        clearFilterSelections();
+        m_autoScroll = true;
+        lblDataRate->setText(QStringLiteral("0 帧/秒"));
+    }
     setConnectionState(ConnectionState::Connected, interfaceType);
     m_pendingSerialPortName.clear();
     m_hasWarnedAutoSendClosed = false;

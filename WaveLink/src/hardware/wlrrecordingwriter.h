@@ -41,7 +41,7 @@ public:
                            bool *usesHostReceiveTime = nullptr,
                            QStringList *channelNames = nullptr);
     static bool exportToCsv(const QStringList &files, QIODevice *destination,
-                            QString &error);
+                            QString &error, const std::function<void(qint64, qint64)> &progress = {});
     static QStringList recoverInterruptedFiles(const QString &directory,
                                                QStringList &errors);
 

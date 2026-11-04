@@ -62,6 +62,21 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
     auto limit = window.findChild<QSpinBox *>("spinPlotHistoryLimit");
     auto usage = window.findChild<QLabel *>("lblPlotHistoryUsage");
     auto slider = window.findChild<RangeSlider *>("timeRangeSlider"); VERIFY(limit && usage && slider && limit->value() == 16);
+    auto playback = window.findChild<QPushButton *>("btnOfflinePlayback");
+    VERIFY(playback && !playback->isEnabled() && playback->text().isEmpty() && !playback->toolTip().isEmpty());
+    const auto playIcon = playback->icon().cacheKey();
+    const auto typeNumber = [](QDoubleSpinBox *spin, const QString &digits) {
+        spin->setFocus();
+        spin->selectAll();
+        for (const auto digit : digits) {
+            QKeyEvent key(QEvent::KeyPress, Qt::Key_0 + digit.digitValue(), Qt::NoModifier, QString(digit));
+            QApplication::sendEvent(spin, &key);
+        }
+    };
+    const auto confirmNumber = [](QDoubleSpinBox *spin) {
+        QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"));
+        QApplication::sendEvent(spin, &enter);
+    };
     const auto complete = [&](QCPGraph *graph) {
         if (paged) {
             auto indexed = dynamic_cast<WaveformGraph *>(graph); if (!indexed || !indexed->hasOfflineSource() || indexed->sourceSampleCount() != Rows) return false;
@@ -76,12 +91,37 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
         messages.lastTitle.clear(); const bool imported = offlineHistoryFileAction(window, path, true);
         if (!imported || messages.lastTitle != "导入成功") std::cerr << "Offline import picked=" << imported << " title=" << messages.lastTitle.toStdString() << " text=" << messages.lastText.toStdString() << '\n';
         VERIFY(imported && messages.lastTitle == "导入成功");
+        if (paged) {
+            VERIFY(messages.lastText.contains("设置 → 系统设置 → 绘图显示 → 离线完整加载上限"));
+            VERIFY(messages.lastText.contains("手动调大") && messages.lastText.contains("重新导入"));
+        }
         VERIFY(main->graphCount() == 2 && complete(main->graph(0)) && complete(main->graph(1)));
         VERIFY(main->graph(0)->data()->constBegin()->value == -1000 && (main->graph(0)->data()->constEnd() - 1)->value == 2000);
         VERIFY(paged ? usage->text().contains("按需浏览") : usage->text().contains("完整保留"));
         if (paged) VERIFY(main->graph(0)->dataCount() < Rows / 10);
         VERIFY(std::abs(main->xAxis->range().lower) < 1e-9 && std::abs(main->xAxis->range().upper - lastTime) < 1e-7);
         VERIFY(std::abs(slider->lowerValue()) < 1e-9 && std::abs(slider->upperValue() - lastTime) < 1e-7);
+        VERIFY(playback->isEnabled() && playback->icon().cacheKey() == playIcon);
+        playback->click();
+        VERIFY(playback->icon().cacheKey() == playIcon && slider->lowerValue() == 0 &&
+               std::abs(slider->upperValue() - lastTime) < 1e-7);
+        if (path == csvPath) {
+            auto fs = window.findChild<QDoubleSpinBox *>("spinFs");
+            auto cutoff = window.findChild<QDoubleSpinBox *>("spinLPFFreq");
+            VERIFY(fs && cutoff);
+            const auto revision = main->graph(0)->data()->prefixRevision();
+            const double oldRate = fs->value(), oldCutoff = cutoff->value();
+            typeNumber(fs, "500");
+            VERIFY(fs->value() == oldRate && fs->text().startsWith("500"));
+            confirmNumber(fs);
+            VERIFY(fs->value() == 500 && main->graph(0)->data()->prefixRevision() == revision);
+            typeNumber(cutoff, "15");
+            VERIFY(cutoff->value() == oldCutoff && cutoff->text().startsWith("15"));
+            confirmNumber(cutoff);
+            VERIFY(cutoff->value() == 15 && main->graph(0)->data()->prefixRevision() == revision);
+            fs->setValue(oldRate);
+            cutoff->setValue(oldCutoff);
+        }
         limit->setValue(32); limit->setValue(16);
         VERIFY(complete(main->graph(0)) && complete(main->graph(1)));
         auto scope = main->findChild<PlotMeasurementController *>(); VERIFY(scope); scope->setEnabled(true); scope->refresh();
@@ -101,7 +141,9 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
             for (auto spin : window.findChildren<QDoubleSpinBox *>()) if (spin->value() == 10 && spin->suffix().contains("Hz") && spin->maximum() < 100000) frequency = spin;
             VERIFY(frequency); const double previous = frequency->value(); bool canceled = false; QTimer cancelFilter;
             QObject::connect(&cancelFilter, &QTimer::timeout, [&] { for (auto progress : window.findChildren<QProgressDialog *>()) if (progress->objectName() == "offlineFilterProgress") { canceled = true; progress->cancel(); } });
-            cancelFilter.start(1); frequency->setValue(15); cancelFilter.stop();
+            typeNumber(frequency, "15");
+            VERIFY(frequency->value() == previous);
+            cancelFilter.start(1); confirmNumber(frequency); cancelFilter.stop();
             VERIFY(canceled && frequency->value() == previous && lowpass->isChecked() && complete(main->graph(0)));
         }
         lowpass->setChecked(false);
@@ -123,6 +165,59 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
         limit->setValue(32); limit->setValue(16);
         for (auto plot : {main, separate}) for (int ch = 0; ch < plot->graphCount(); ++ch) VERIFY(complete(plot->graph(ch)));
         std::cout << "Complete " << QFileInfo(path).suffix().toStdString() << " survives limit changes, measurement, filtering, panning and detached views.\n";
+        if (path == csvPath) {
+            slider->setValues(1, 1.5);
+            QElapsedTimer playbackTime; playbackTime.start();
+            playback->click();
+            VERIFY(playback->toolTip().contains("暂停") && playback->icon().cacheKey() != playIcon);
+            VERIFY(until([&] { return slider->lowerValue() >= 1.18; }));
+            VERIFY(std::abs(slider->lowerValue() - 1 - playbackTime.elapsed() / 1000.0) < .18);
+            VERIFY(std::abs(slider->upperValue() - slider->lowerValue() - .5) < 1e-9);
+            VERIFY(main->xAxis->range() == separate->xAxis->range() &&
+                   main->xAxis->range().lower == slider->lowerValue());
+            if (paged) {
+                const auto samples = main->graph(0)->data();
+                VERIFY(!samples->isEmpty() && samples->constBegin()->key >= slider->lowerValue() &&
+                       (samples->constEnd() - 1)->key > slider->upperValue() - .002);
+            }
+            playback->click();
+            VERIFY(playback->icon().cacheKey() == playIcon && playback->toolTip().contains("播放离线波形"));
+            const auto pausedRange = main->xAxis->range();
+            playbackTime.restart();
+            VERIFY(until([&] { return playbackTime.elapsed() >= 100; }));
+            VERIFY(main->xAxis->range() == pausedRange);
+            playback->click();
+            VERIFY(until([&] { return slider->lowerValue() > pausedRange.lower; }));
+            slider->setValues(lastTime - .62, lastTime - .12);
+            VERIFY(playback->icon().cacheKey() == playIcon);
+            playback->click();
+            VERIFY(until([&] { return playback->icon().cacheKey() == playIcon; }));
+            VERIFY(std::abs(slider->upperValue() - lastTime) < 1e-7 &&
+                   std::abs(slider->upperValue() - slider->lowerValue() - .5) < 1e-9);
+            playback->click();
+            VERIFY(playback->icon().cacheKey() != playIcon && slider->lowerValue() < .1);
+            auto open = window.findChild<QPushButton *>("btnOpenClose");
+            auto ports = window.findChild<QComboBox *>("comboPorts");
+            ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY");
+            open->click(); VERIFY(until([&] { return open->text().contains("关闭"); }));
+            VERIFY(!playback->isEnabled() && playback->icon().cacheKey() == playIcon);
+            for (auto plot : {main, separate}) for (int ch = 0; ch < plot->graphCount(); ++ch) {
+                auto graph = dynamic_cast<WaveformGraph *>(plot->graph(ch));
+                VERIFY(graph && graph->dataCount() == 0 && !graph->hasOfflineSource());
+            }
+            VERIFY(QDir(folder.path()).entryList({"WaveLink_Browse_*"}, QDir::Dirs | QDir::NoDotAndDotDot).isEmpty());
+            const auto range = main->xAxis->range();
+            VERIFY(!usage->text().contains("离线波形") && range.size() == 10 && range.contains(0));
+            window.findChild<QPushButton *>("btnPausePlot")->setChecked(false);
+            VERIFY(QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({42, 43}))));
+            VERIFY(QMetaObject::invokeMethod(&window, "onPlotTimer"));
+            VERIFY(main->graph(0)->dataCount() == 1 && main->graph(0)->data()->constBegin()->key == 0 &&
+                   main->graph(0)->data()->constBegin()->value == 42);
+            open->click(); VERIFY(until([&] { return open->text().contains("打开"); }));
+            open->click(); VERIFY(until([&] { return open->text().contains("关闭"); }));
+            VERIFY(main->graph(0)->dataCount() == 1);
+            open->click(); VERIFY(until([&] { return open->text().contains("打开"); }));
+        }
     }
     // Export retains the first and last samples and every intervening row,
     // even when the visible time window shows only the end of the recording.

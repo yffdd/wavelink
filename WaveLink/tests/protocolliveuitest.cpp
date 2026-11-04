@@ -312,9 +312,12 @@ static void confirmSwitch() {
 class OffscreenMessages : public QObject {
 public:
     bool openOfflineSettings = false;
+    bool sawRecordingSaveProgress = false;
     QString commandButton = "configCommandSkip",statusButton="configStatusSkip",standaloneStatusButton="statusStandaloneCancel", lastTitle, lastText;
 protected:
     bool eventFilter(QObject *object, QEvent *event) override {
+        if (event->type() == QEvent::Show && object->objectName() == "recordingSaveProgress")
+            sawRecordingSaveProgress = object->findChild<QProgressBar *>() != nullptr;
         if (event->type() == QEvent::Show) if (auto box = qobject_cast<QMessageBox *>(object)) {
             lastTitle = box->windowTitle(); lastText = box->text();
             auto choice = box->objectName() == "configCommandImportDialog" ? box->findChild<QPushButton *>(commandButton) : nullptr;
@@ -1341,6 +1344,10 @@ static int recordingShapeUiTests(OffscreenMessages &messages) {
     for (auto check : window.findChildren<QCheckBox *>()) if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通") || check->text() == "录前清空") check->setChecked(false);
     auto ports = window.findChild<QComboBox *>("comboPorts"); ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY"); open->click(); VERIFY(until([&] { return open->text().contains("关闭"); }));
     auto record = window.findChild<QPushButton *>("btnToggleRecord"); auto mode = window.findChild<QComboBox *>("comboRecordingMode");
+    QPushButton *save = nullptr;
+    for (auto button : window.findChildren<QPushButton *>())
+        if (button->text().contains("保存数据")) save = button;
+    VERIFY(save);
     auto warning = window.findChild<QLabel *>("lblRecordingWarning"); VERIFY(record && mode && warning && warning->isHidden());
     VERIFY(record->text() == "开始录制" && !record->icon().isNull());
     const auto recordIcon = record->icon().cacheKey();
@@ -1366,6 +1373,25 @@ static int recordingShapeUiTests(OffscreenMessages &messages) {
         VERIFY(until([&] { return warning->text() == "录制中 · 已跳过 2 帧异常数据"; }) && record->text().contains("停止") && messages.lastTitle.isEmpty());
         record->click(); VERIFY(until([&] { return record->text().contains("开始"); }) && warning->isHidden() && warning->text().isEmpty());
         VERIFY(record->text() == "开始录制" && record->icon().cacheKey() == recordIcon);
+        const auto outputPath = directory.filePath(QString("saved-%1.csv").arg(format));
+        messages.sawRecordingSaveProgress = false;
+        bool picked = false;
+        QTimer picker;
+        QObject::connect(&picker, &QTimer::timeout, &window, [&] {
+            if (auto dialog = qobject_cast<QFileDialog *>(QApplication::activeModalWidget())) {
+                if (picked) return;
+                picked = true;
+                dialog->selectFile(outputPath);
+                QMetaObject::invokeMethod(dialog, "accept", Qt::QueuedConnection);
+            }
+        });
+        picker.start(10);
+        save->click();
+        picker.stop();
+        VERIFY(picked && messages.sawRecordingSaveProgress && messages.lastTitle == "导出成功");
+        QFile savedFile(outputPath);
+        VERIFY(savedFile.open(QIODevice::ReadOnly) && savedFile.readAll().trimmed().split('\n').size() == 4);
+        messages.lastTitle.clear();
         // Start again: use 17 as the NEW fixed width, and count from zero.
         record->click(); VERIFY(record->text().contains("停止") && warning->isHidden() && worker->skippedRecordingFrames() == 0);
         VERIFY(record->icon().cacheKey() == recordIcon);
@@ -2273,10 +2299,11 @@ int main(int argc, char **argv) {
         imported.findChild<QTimer *>("serialHardwareCheckTimer")->stop();
         auto ports = imported.findChild<QComboBox *>("comboPorts"); ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY");
         auto open = imported.findChild<QPushButton *>("btnOpenClose"); open->click(); VERIFY(until([&] { return open->text().contains("关闭"); }));
-        VERIFY(preciseGraph->name() != "原始精度");
+        VERIFY(preciseGraph->name() != "原始精度" && preciseGraph->data()->isEmpty());
         VERIFY(QMetaObject::invokeMethod(&imported, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({20, 30}))));
         VERIFY(QMetaObject::invokeMethod(&imported, "onPlotTimer"));
-        VERIFY((preciseGraph->data()->constEnd() - 1)->value == 20);
+        VERIFY(preciseGraph->dataCount() == 1 && preciseGraph->data()->constBegin()->key == 0 &&
+               preciseGraph->data()->constBegin()->value == 20);
         const double previousTime = (preciseGraph->data()->constEnd() - 1)->key;
         QDoubleSpinBox *liveFs = nullptr;
         for (auto spin : imported.findChildren<QDoubleSpinBox *>()) if (spin->suffix() == " Hz" && spin->maximum() == 100000) liveFs = spin;

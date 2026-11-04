@@ -344,7 +344,7 @@ bool WlrRecordingWriter::visitFiles(const QStringList &files, const FrameVisitor
 }
 
 bool WlrRecordingWriter::exportToCsv(const QStringList &files, QIODevice *destination,
-                                     QString &error)
+                                     QString &error, const std::function<void(qint64, qint64)> &progress)
 {
     bool headerWritten = false;
     int channelCount = 0;
@@ -357,8 +357,14 @@ bool WlrRecordingWriter::exportToCsv(const QStringList &files, QIODevice *destin
     if (!destination || !destination->isWritable()) { error = "CSV 导出目标不可写。"; return false; }
     // The binary format retains each frame's actual width. Discover the union
     // once, then stream a rectangular CSV without losing any shorter frames.
-    if (!visitFiles(files, [&](qint64, const QVector<double> &values, qint64) { channelCount = qMax(channelCount, values.size()); return true; }, error)) return false;
-    return visitFiles(files, [&](qint64 timestamp, const QVector<double> &values, qint64) {
+    qint64 sourceBytes = 0;
+    if (progress) for (const auto &path : files) sourceBytes += QFileInfo(path).size();
+    if (!visitFiles(files, [&](qint64, const QVector<double> &values, qint64 bytes) {
+        channelCount = qMax(channelCount, values.size());
+        if (progress) progress(bytes, 2 * sourceBytes);
+        return true;
+    }, error)) return false;
+    const bool ok = visitFiles(files, [&](qint64 timestamp, const QVector<double> &values, qint64 bytes) {
         if (!headerWritten) {
             QByteArray header = hostTime
                 ? RecordingChannels::csvReceiveTimeColumn(sampleRateHint) + ",SampleIndex"
@@ -391,8 +397,11 @@ bool WlrRecordingWriter::exportToCsv(const QStringList &files, QIODevice *destin
             error = QStringLiteral("写入 CSV 数据失败。");
             return false;
         }
+        if (progress) progress(sourceBytes + bytes, 2 * sourceBytes);
         return true;
     }, error, &sampleRateHint, &hostTime, &names) && error.isEmpty();
+    if (ok && progress) progress(2 * sourceBytes, 2 * sourceBytes);
+    return ok;
 }
 
 QStringList WlrRecordingWriter::recoverInterruptedFiles(const QString &directory,
