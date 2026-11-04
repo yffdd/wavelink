@@ -49,8 +49,33 @@ static Rule readRule(const QJsonObject &o) {
     t.datagram=a["datagram"].toBool();t.trim=a["trim"].toBool();t.caseSensitive=a["caseSensitive"].toBool();t.strictSync=a["strictSync"].toBool();t.maxBytes=a["maxBytes"].toInt();t.partialTimeoutMs=a["partialTimeoutMs"].toInt();return r;
 }
 QVector<Rule> flatten(const QVector<Panel> &panels) {QVector<Rule> rules;for(auto p:panels){normalizeBinding(p);for(auto r:p.items) {r.enabled=r.enabled&&p.enabled;if(r.source==Source::Text) r.textSource.id=p.id+":"+(r.textSource.id.isEmpty()?r.id:r.textSource.id);rules.append(r);}}return rules;}
-Panel duplicate(const Panel &p) {auto copy=p;copy.id=newId();copy.name+="_1";QHash<QString,QString> sources;
-    for(auto &r:copy.items) {r.id=newId();if(!r.textSource.id.isEmpty()) {if(!sources.contains(r.textSource.id)) sources[r.textSource.id]=newId();r.textSource.id=sources[r.textSource.id];}for(auto &m:r.textMatches)m.id=newId();}return copy;}
+QVector<PanelLayout::Item> layoutItems(const Panel &panel)
+{
+    QVector<PanelLayout::Item> items;
+    items.reserve(panel.items.size());
+    for (const auto &rule : panel.items) items.append({rule.id, rule.name});
+    return items;
+}
+
+Panel duplicate(const Panel &p)
+{
+    auto copy = p;
+    copy.id = newId();
+    copy.name += "_1";
+    QHash<QString, QString> sources, newIds;
+    for (auto &rule : copy.items) {
+        const auto oldId = rule.id;
+        rule.id = newId();
+        newIds.insert(oldId, rule.id);
+        if (!rule.textSource.id.isEmpty()) {
+            if (!sources.contains(rule.textSource.id)) sources[rule.textSource.id] = newId();
+            rule.textSource.id = sources[rule.textSource.id];
+        }
+        for (auto &match : rule.textMatches) match.id = newId();
+    }
+    PanelLayout::remap(copy.layoutRows, newIds);
+    return copy;
+}
 Panel duplicateForAppend(const Panel &panel,const QStringList &names){auto copy=duplicate(panel);copy.name=panel.name;int suffix=1;while(names.contains(copy.name))copy.name=panel.name+"_"+QString::number(suffix++);return copy;}
 bool protectedExportPath(const QString &path,const QString &storePath){
     const auto folder=QFileInfo(storePath).absoluteDir();
@@ -65,12 +90,18 @@ QByteArray encode(const QVector<Panel> &panels,QString &error) {
     for(auto p:panels) {
         normalizeBinding(p);
         if(p.protocolName.size()>1024||p.protocolId.size()>128||p.protocolShape.size()>1024||(p.bindingMode==BindingMode::Locked&&(p.protocolId.isEmpty()||p.protocolShape.isEmpty()||p.protocolId=="builtin.raw"))||(p.bindingMode!=BindingMode::Locked&&(!p.protocolId.isEmpty()||!p.protocolShape.isEmpty()||!p.protocolName.isEmpty()))){error="面板协议绑定无效。";return {};}
-        if(p.id.isEmpty()||p.id.size()>128||ids.contains(p.id)||p.name.trimmed().isEmpty()||p.name.size()>1024||p.note.size()>32768||p.columns<1||p.columns>8) {error="面板名称、ID 或布局无效。";return {};}
+        if(p.id.isEmpty()||p.id.size()>128||ids.contains(p.id)||p.name.trimmed().isEmpty()||p.name.size()>1024||p.note.size()>32768||p.columns<1||p.columns>PanelLayout::StatusMaxColumns) {error="面板名称、ID 或布局无效。";return {};}
         ids.insert(p.id);QJsonArray rows;for(const auto &r:p.items) {
             if(items.contains(r.id)||r.note.size()>32768) {error="监视项 ID 重复或说明过长。";return {};}
             items.insert(r.id);rows.append(ruleJson(r));
         }
-        array.append(QJsonObject{{"id",p.id},{"name",p.name},{"note",p.note},{"enabled",p.enabled},{"columns",p.columns},{"binding",bindingJson(p)},{"items",rows}});
+        if (p.layoutRows && PanelLayout::arrange(layoutItems(p), p.columns, *p.layoutRows) != *p.layoutRows) {
+            error = QStringLiteral("面板“%1”的自定义分行无效。").arg(p.name);
+            return {};
+        }
+        QJsonObject panel{{"id",p.id},{"name",p.name},{"note",p.note},{"enabled",p.enabled},{"columns",p.columns},{"binding",bindingJson(p)},{"items",rows}};
+        PanelLayout::write(panel, p.layoutRows);
+        array.append(panel);
     }
     if(!Engine::validate(flatten(panels),error)) return {};
     auto bytes=QJsonDocument(QJsonObject{{"fileType","WaveLink.StatusPanels"},{"schemaVersion",1},{"panels",array}}).toJson();
@@ -88,6 +119,7 @@ bool decode(const QByteArray &bytes,QVector<Panel> &panels,QString &error) {
     for(const auto &v:o["panels"].toArray()) {const auto a=v.toObject();Panel p;p.id=a["id"].toString();p.name=a["name"].toString();p.note=a["note"].toString();p.enabled=a["enabled"].toBool();p.columns=a["columns"].toInt();
         for(const auto &r:a["items"].toArray()) {const auto obj=r.toObject();for(const auto &m:obj["mappings"].toArray()) {const auto n=m.toObject()["value"].toDouble(-1);if(n<0||n>4294967295.0||std::floor(n)!=n){error="映射整数越界。";return false;}}p.items.append(readRule(obj));}
         if(a.contains("binding")){auto b=a["binding"].toObject();const auto mode=b["mode"].toString();if(mode!="locked"&&mode!="follow"&&mode!="legacy"){error="面板协议绑定模式无效。";return false;}p.bindingMode=mode=="locked"?BindingMode::Locked:mode=="follow"?BindingMode::Follow:BindingMode::Legacy;p.protocolId=b["protocolId"].toString();p.protocolShape=b["protocolShape"].toString().toLatin1();p.protocolName=b["protocolName"].toString();}
+        if (!PanelLayout::read(a.value("layoutRows"), layoutItems(p), p.columns, p.layoutRows, error)) return false;
         normalizeBinding(p);candidate.append(p);}
     const auto canonical=encode(candidate,error);if(canonical.isEmpty()) return false;
     // Event and panel binding blocks are optional only for older schema-1 files.

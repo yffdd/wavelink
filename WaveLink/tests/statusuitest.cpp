@@ -107,6 +107,76 @@ int main(int argc,char **argv){QApplication app(argc,argv);QCoreApplication::set
         list->setCurrentRow(1);window.close();CHECK(!window.isVisible());publisher.send(0);window.show();settle();CHECK(list->currentRow()==1);
     }
     {StatusMonitorWindow reopened([&]{return ctx;},[&](const QVector<Rule>&r,QString&e){return session.configure(r,e);},nullptr,windowPath);CHECK(reopened.panels().size()==2);CHECK(reopened.findChild<QListWidget*>("statusPanelList")->currentRow()==1);}
+    {
+        auto custom = p;
+        custom.layoutRows = PanelLayout::Rows{{p.items[0].id}, {p.items[1].id, p.items[2].id, p.items[3].id}};
+        int applied = 0;
+        const auto path = dir.filePath("layout.json");
+        StatusMonitorWindow window([&]{return ctx;}, [&](const QVector<Rule> &, QString &) { ++applied; return true; }, nullptr, path);
+        CHECK(window.replacePanels({custom}, error));
+        const int appliedBeforeLayout = applied;
+        window.resize(690, 580);
+        window.show();
+        settle();
+        auto scroll = window.findChild<QScrollArea *>("statusCardScroll");
+        CHECK(scroll && scroll->horizontalScrollBar()->maximum() > 0);
+        QHash<QString, QFrame *> cards;
+        for (auto card : window.findChildren<QFrame *>("statusCard")) cards.insert(card->property("ruleId").toString(), card);
+        CHECK(cards.size() == 4 && cards[p.items[0].id]->y() < cards[p.items[1].id]->y());
+        CHECK(cards[p.items[1].id]->y() == cards[p.items[3].id]->y());
+        auto edit = window.findChild<QPushButton *>("statusEditLayout");
+        CHECK(edit && edit->isVisible());
+        const auto drive = [&](bool save) {
+            QTimer::singleShot(0, &window, [save] {
+                auto dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                if (!dialog) return;
+                const auto rows = dialog->findChildren<QListWidget *>("panelLayoutRow");
+                auto columns = dialog->findChild<QSpinBox *>("panelLayoutColumns");
+                if (dialog->objectName() != "statusLayoutEditor" || rows.size() != 2 || rows.last()->count() != 3 ||
+                    !columns || columns->value() != 3 || columns->maximum() != 8) {
+                    dialog->reject();
+                    return;
+                }
+                dialog->findChildren<QPushButton *>("panelLayoutRowDown").first()->click();
+                columns->setValue(2);
+                dialog->findChild<QDialogButtonBox *>()->button(save ? QDialogButtonBox::Save : QDialogButtonBox::Cancel)->click();
+            });
+            edit->click();
+        };
+        drive(false);
+        CHECK(window.panels()[0].layoutRows == custom.layoutRows && window.panels()[0].columns == 3 && applied == appliedBeforeLayout);
+        drive(true);
+        const PanelLayout::Rows expected{{p.items[1].id, p.items[2].id}, {p.items[3].id}, {p.items[0].id}};
+        CHECK(window.panels()[0].layoutRows == expected && window.panels()[0].columns == 2 && applied == appliedBeforeLayout);
+        settle();
+        CHECK(cards[p.items[1].id]->y() < cards[p.items[0].id]->y());
+        Store store(path);
+        QVector<Panel> reloaded;
+        CHECK(store.load(reloaded, error) && reloaded[0].layoutRows == expected && reloaded[0].columns == 2);
+
+        bool settingsSynced = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog) return;
+            auto columns = dialog->findChild<QSpinBox *>("statusPanelColumns");
+            settingsSynced = columns && columns->value() == 2;
+            if (!settingsSynced) { dialog->reject(); return; }
+            columns->setValue(4);
+            dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Save)->click();
+        });
+        window.findChild<QPushButton *>("statusPanelSettings")->click();
+        CHECK(settingsSynced && window.panels()[0].columns == 4 && window.panels()[0].layoutRows == expected);
+        bool editorSynced = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog) return;
+            auto columns = dialog->findChild<QSpinBox *>("panelLayoutColumns");
+            editorSynced = columns && columns->value() == 4;
+            dialog->reject();
+        });
+        edit->click();
+        CHECK(editorSynced);
+    }
     app.setStyleSheet("QWidget {background:#f0f0f0;color:#202020;}");
     {
         StatusItemDialog dialog(p.items[0],p.items,ctx);dialog.show();dialog.activateWindow();settle();

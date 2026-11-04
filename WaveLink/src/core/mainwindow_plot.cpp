@@ -57,6 +57,7 @@
 #include <QMenuBar>
 #include <QToolBar>
 #include <QStyle>
+#include <algorithm>
 
 namespace {
 // Use QCP's own padded text bounds, in logical pixels, after axis layout.
@@ -762,7 +763,7 @@ void MainWindow::handleChannelsUpdated(const QVector<double> &data)
         for (int i = 0; i < data.size(); ++i) moveChannelToNewPlot(i);
     }
 
-    if (chkPausePlot && chkPausePlot->isChecked()) {
+    if (btnPausePlot && btnPausePlot->isChecked()) {
         return;
     }
     
@@ -855,7 +856,7 @@ void MainWindow::onPlotTimer()
         while (handler && delivered < frameBudget && deliveryClock.elapsed() < 8) {
             quint64 dropped = 0;
             const auto batch = handler->takePlotFrames(qMin(32, frameBudget - delivered), dropped);
-            if (dropped && !(chkPausePlot && chkPausePlot->isChecked())) {
+            if (dropped && !(btnPausePlot && btnPausePlot->isChecked())) {
                 // Preserve the time gap when old display samples are discarded.
                 sampleCount += dropped;
                 const double dt = spinFs->value() > 0 ? 1.0 / spinFs->value() : 0.001;
@@ -929,7 +930,7 @@ void MainWindow::onPlotTimer()
     double currentT = times.last();
     lastLatestTime = currentT;
     enforcePlotHistoryLimit(updateLabels);
-    if (chkPausePlot->isChecked()) {
+    if (btnPausePlot->isChecked()) {
         return;
     } else {
         for (PlotContext &ctx : allPlots) {
@@ -1198,6 +1199,48 @@ void MainWindow::autoScaleY()
     }
     syncTimeRangeSlider(allPlots[0].plot->xAxis->range());
 }
+QList<QDockWidget *> MainWindow::detachedPlotDocksInDisplayOrder() const
+{
+    QList<QDockWidget *> docks;
+    for (int i = 1; i < allPlots.size(); ++i) docks.append(allPlots[i].dock);
+    // Dock dragging can change the visible order independently of allPlots.
+    std::stable_sort(docks.begin(), docks.end(), [](const QDockWidget *a, const QDockWidget *b) {
+        if (a->y() != b->y()) return a->y() < b->y();
+        return a->x() < b->x();
+    });
+    return docks;
+}
+
+void MainWindow::moveDetachedPlot(QDockWidget *dock, int direction)
+{
+    auto docks = detachedPlotDocksInDisplayOrder();
+    const int from = docks.indexOf(dock);
+    const int to = from + direction;
+    if (from < 0 || to < 0 || to >= docks.size()) return;
+
+    docks.swapItemsAt(from, to);
+    docks.prepend(allPlots.first().dock);
+    QList<int> heights;
+    for (auto plotDock : docks) heights.append(plotDock->height());
+
+    QList<PlotContext> reordered;
+    QVector<int> newIndices(allPlots.size());
+    for (auto plotDock : docks) {
+        const auto context = std::find_if(allPlots.cbegin(), allPlots.cend(), [plotDock](const PlotContext &ctx) {
+            return ctx.dock == plotDock;
+        });
+        newIndices[context - allPlots.cbegin()] = reordered.size();
+        reordered.append(*context);
+    }
+    allPlots.swap(reordered);
+    for (int &plotIndex : channelToPlotMap) plotIndex = newIndices[plotIndex];
+
+    stackPlotDocksVertically(innerMainWindow, docks);
+    innerMainWindow->resizeDocks(docks, heights, Qt::Vertical);
+    innerMainWindow->layout()->activate();
+    if (plotScrollArea) plotScrollArea->ensureWidgetVisible(dock, 0, 0);
+}
+
 void MainWindow::moveChannelToNewPlot(int chIdx)
 {
     if (chIdx < 0 || chIdx >= channelGraphs.size()) return;
@@ -1879,6 +1922,18 @@ void MainWindow::onPlotContextMenu(const QPoint &pos)
         // back to the retained main graphs. Never capture a mutable plot index.
         if (targetDock) targetDock->close();
     });
+    const auto detachedDocks = detachedPlotDocksInDisplayOrder();
+    const int position = detachedDocks.indexOf(targetDock.data());
+    QAction *moveUp = menu.addAction(QStringLiteral("视图位置上移"));
+    QAction *moveDown = menu.addAction(QStringLiteral("视图位置下移"));
+    moveUp->setEnabled(position > 0);
+    moveDown->setEnabled(position >= 0 && position + 1 < detachedDocks.size());
+    connect(moveUp, &QAction::triggered, this, [this, targetDock] {
+        if (targetDock) moveDetachedPlot(targetDock, -1);
+    });
+    connect(moveDown, &QAction::triggered, this, [this, targetDock] {
+        if (targetDock) moveDetachedPlot(targetDock, 1);
+    });
     menu.addSeparator();
     QMenu *addMenu = menu.addMenu("添加通道显示");
     QMenu *removeMenu = menu.addMenu("移除通道显示");
@@ -1973,7 +2028,7 @@ void MainWindow::updatePlotTitle(int plotIdx)
 
 void MainWindow::onPlotMouseMove(QMouseEvent *event)
 {
-    if (!chkPausePlot->isChecked() && isPortOpen) return; // Only hover snap when paused or disconnected
+    if (!btnPausePlot->isChecked() && isPortOpen) return; // Only hover snap when paused or disconnected
     if (event->buttons() != Qt::NoButton) return; // never scan samples while panning
     if (m_plotHoverClock.isValid() && m_plotHoverClock.elapsed() < 33) return;
     m_plotHoverClock.start();

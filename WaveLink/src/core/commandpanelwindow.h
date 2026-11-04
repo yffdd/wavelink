@@ -37,6 +37,7 @@
 #include <QTableWidget>
 #include <array>
 #include <functional>
+#include "panellayout.h"
 
 enum class CommandWidgetType { Button = 0, Slider = 1, Switch = 2 };
 enum class CommandSliderMode { Regular = 0, List = 1 };
@@ -82,6 +83,7 @@ struct PanelDef {
     int buttonWidth = 200;
     int buttonHeight = 60;
     QList<CommandDef> commands;
+    PanelLayout::Layout layoutRows;
 };
 
 // Dialog to view and edit panel remarks
@@ -360,6 +362,14 @@ private:
     int m_dragTargetIndex = -1;
     QPoint m_dragOffset;
     
+    friend class CommandPanelWindow;
+    PanelLayout::Layout m_layoutRows;
+    std::function<bool(QString &)> m_saveLayout;
+    QSet<QString> m_commandIds;
+
+    QVector<PanelLayout::Item> layoutItems() const;
+    void editLayout();
+    void appendCommandWidget(CommandDef def);
     void connectCommandWidget(CommandButton *btn);
     void rebuildLayout(bool animate = false);
 };

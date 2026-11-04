@@ -82,6 +82,29 @@ QIcon layoutActionIcon(bool restore) {
     }
     return icon;
 }
+
+QIcon plotPlaybackIcon(bool paused)
+{
+    QIcon icon;
+    for (int size : {16, 24, 32, 48}) {
+        QPixmap pixmap(size, size);
+        pixmap.fill(Qt::transparent);
+        QPainter painter(&pixmap);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.scale(size / 16.0, size / 16.0);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(Qt::white);
+        if (paused) {
+            painter.drawPolygon(QPolygonF({QPointF(4, 2), QPointF(13, 8), QPointF(4, 14)}));
+        } else {
+            painter.drawRoundedRect(QRectF(3, 2, 3.5, 12), 1, 1);
+            painter.drawRoundedRect(QRectF(9.5, 2, 3.5, 12), 1, 1);
+        }
+        painter.end();
+        icon.addPixmap(pixmap);
+    }
+    return icon;
+}
 }
 
 MainWindow::MainWindow(QWidget *parent, SerialHandler *serialBackend)
@@ -1235,8 +1258,23 @@ void MainWindow::setupDockWidgets()
     
     // Row 1: Record button + clear-before-record checkbox
     QHBoxLayout *recordRowLayout = new QHBoxLayout();
-    btnToggleRecord = new QPushButton("🔴 开始录制");
+    btnToggleRecord = new QPushButton(QStringLiteral("开始录制"));
     btnToggleRecord->setObjectName("btnToggleRecord");
+    QIcon recordIcon;
+    for (int size : {16, 24, 32, 48}) {
+        QPixmap pixmap(size, size);
+        pixmap.fill(Qt::transparent);
+        QPainter painter(&pixmap);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.scale(size / 16.0, size / 16.0);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor("#e23d45"));
+        painter.drawEllipse(QRectF(2, 2, 12, 12));
+        painter.end();
+        recordIcon.addPixmap(pixmap);
+    }
+    btnToggleRecord->setIcon(recordIcon);
+    btnToggleRecord->setIconSize(QSize(16, 16));
     chkClearBeforeRecord = new QCheckBox("录前清空");
     chkClearBeforeRecord->setChecked(true);
     chkClearBeforeRecord->setToolTip("开始录制时先清空波形显示，使界面与录制数据保持一致");
@@ -1951,7 +1989,22 @@ void MainWindow::setupDockWidgets()
     chkSelectAllChannels = new QCheckBox("全选/ 取消全选");
     chkSelectAllChannels->setChecked(true);
     
-    chkPausePlot = new QCheckBox("暂停绘图");
+    btnPausePlot = new QPushButton(QStringLiteral("暂停绘图"));
+    btnPausePlot->setObjectName("btnPausePlot");
+    btnPausePlot->setCheckable(true);
+    btnPausePlot->setCursor(Qt::PointingHandCursor);
+    btnPausePlot->setIconSize(QSize(16, 16));
+    const QIcon pauseIcon = plotPlaybackIcon(false);
+    const QIcon resumeIcon = plotPlaybackIcon(true);
+    const auto updatePauseButton = [this, pauseIcon, resumeIcon](bool paused) {
+        btnPausePlot->setText(paused ? QStringLiteral("继续绘图（已暂停）") : QStringLiteral("暂停绘图"));
+        btnPausePlot->setIcon(paused ? resumeIcon : pauseIcon);
+        btnPausePlot->setToolTip(paused
+            ? QStringLiteral("绘图已暂停。点击后继续更新波形。")
+            : QStringLiteral("绘图更新中。点击暂停波形更新，数据接收和录制继续。"));
+    };
+    updatePauseButton(false);
+    connect(btnPausePlot, &QPushButton::toggled, this, updatePauseButton);
     
     QLabel *lblDecimals = new QLabel("Y轴小数位数:");
     spinDecimals = new QSpinBox();
@@ -1986,7 +2039,7 @@ void MainWindow::setupDockWidgets()
         }
     });
     
-    connect(chkPausePlot, &QCheckBox::toggled, this, [this](bool checked) {
+    connect(btnPausePlot, &QPushButton::toggled, this, [this](bool checked) {
         if (!checked) {
             for (PlotContext &ctx : allPlots) {
                 if (ctx.measureState != 0) {
@@ -2035,7 +2088,6 @@ void MainWindow::setupDockWidgets()
 
     QHBoxLayout *chkTopLayout = new QHBoxLayout();
     chkTopLayout->addWidget(chkAutoScaleY);
-    chkTopLayout->addWidget(chkPausePlot);
     chkTopLayout->addWidget(chkShowGrid);
     chkTopLayout->addStretch();
     
@@ -2043,6 +2095,7 @@ void MainWindow::setupDockWidgets()
     channelLayout->addLayout(historyUsageLayout);
     channelLayout->addLayout(chkTopLayout);
     channelLayout->addLayout(decimalLayout);
+    channelLayout->addWidget(btnPausePlot);
     btnScrollToLatest = new QPushButton("跳转至最新时刻");
     btnScrollToLatest->setObjectName("btnScrollToLatest");
     btnScrollToLatest->setCursor(Qt::PointingHandCursor);

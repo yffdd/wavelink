@@ -55,6 +55,32 @@ static bool choosePlotChannelAction(QCustomPlot *plot, const QString &submenu, c
     return triggered;
 }
 
+static bool detachedPlotPositionActions(QCustomPlot *plot, bool canMoveUp, bool canMoveDown, int direction = 0)
+{
+    bool verified = false;
+    QTimer::singleShot(0, [&] {
+        auto menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+        if (!menu) return;
+        const auto actions = menu->actions();
+        for (int i = 0; i + 2 < actions.size(); ++i) {
+            if (actions[i]->text() != QStringLiteral("合并回主视图")) continue;
+            auto up = actions[i + 1];
+            auto down = actions[i + 2];
+            verified = up->text() == QStringLiteral("视图位置上移") && up->isEnabled() == canMoveUp &&
+                       down->text() == QStringLiteral("视图位置下移") && down->isEnabled() == canMoveDown;
+            if (direction != 0) {
+                auto move = direction < 0 ? up : down;
+                verified = verified && move->isEnabled();
+                if (verified) move->trigger();
+            }
+            break;
+        }
+        menu->close();
+    });
+    plot->customContextMenuRequested(plot->axisRect()->rect().center());
+    return verified;
+}
+
 static int detachedChannelRemovalUiTests() {
     QTemporaryDir directory; VERIFY(directory.isValid());
     QSettings settings("WaveLink", "WaveLink"), advanced("WaveLink", "AdvancedApp");
@@ -68,8 +94,9 @@ static int detachedChannelRemovalUiTests() {
     window.findChild<QTimer *>("serialHardwareCheckTimer")->stop();
     window.findChild<QTimer *>("waveformRefreshTimer")->stop();
     for (auto check : window.findChildren<QCheckBox *>()) {
-        if (check->text() == "Y轴自适应" || check->text() == "暂停绘图") check->setChecked(false);
+        if (check->text() == "Y轴自适应") check->setChecked(false);
     }
+    window.findChild<QPushButton *>("btnPausePlot")->setChecked(false);
     const auto feed = [&](const QVector<double> &values) {
         return QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, values)) &&
                QMetaObject::invokeMethod(&window, "onPlotTimer");
@@ -87,6 +114,7 @@ static int detachedChannelRemovalUiTests() {
     VERIFY(detachPlotTestChannel(window, channels, 0));
     QPointer<QDockWidget> groupDock = window.findChild<QDockWidget *>("PlotDock_独立视图: " + names[0]); VERIFY(groupDock);
     QPointer<QCustomPlot> group = groupDock->findChild<QCustomPlot *>(); VERIFY(group);
+    VERIFY(detachedPlotPositionActions(group, false, false));
     VERIFY(choosePlotChannelAction(group, "添加通道显示", names[1]));
     VERIFY(choosePlotChannelAction(group, "添加通道显示", names[2]) && group->graphCount() == 3);
     VERIFY(detachPlotTestChannel(window, channels, 3));
@@ -107,6 +135,15 @@ static int detachedChannelRemovalUiTests() {
         return false;
     };
     VERIFY(hasMarker());
+    VERIFY(until([&] { return mainDock->y() < groupDock->y() && groupDock->y() < otherDock->y(); }));
+    VERIFY(detachedPlotPositionActions(other, true, false, -1));
+    VERIFY(until([&] { return mainDock->y() < otherDock->y() && otherDock->y() < groupDock->y(); }));
+    VERIFY(detachedPlotPositionActions(other, false, true, 1));
+    VERIFY(until([&] { return mainDock->y() < groupDock->y() && groupDock->y() < otherDock->y(); }));
+    VERIFY(detachedPlotPositionActions(group, false, true, 1));
+    VERIFY(until([&] { return mainDock->y() < otherDock->y() && otherDock->y() < groupDock->y(); }));
+    VERIFY(detachedPlotPositionActions(group, true, false));
+    VERIFY(group->graphCount() == 3 && group->graph(0) == first && other->graph(0) == untouched && hasMarker());
     // Remove the middle curve: retain both remaining graph objects/history,
     // their view, the unrelated view, and the other curve's point marker.
     VERIFY(choosePlotChannelAction(group, "移除通道显示", names[1]));
@@ -158,6 +195,7 @@ static int plotReadoutUiTests() {
     QSettings mainSettings("WaveLink", "WaveLink"), advanced("WaveLink", "AdvancedApp");
     mainSettings.clear(); advanced.clear();
     mainSettings.setValue("editCacheDir", directory.path()); advanced.setValue("InterfaceType", 0);
+    mainSettings.setValue("chkPausePlot", true);
     mainSettings.sync(); advanced.sync();
     ProtocolProfileStore store; QString error;
     VERIFY(store.load(error) && store.setSelection(ProtocolSelection::fromLegacy(0), error));
@@ -166,13 +204,16 @@ static int plotReadoutUiTests() {
     QElapsedTimer ready; ready.start(); VERIFY(until([&] { return ready.elapsed() > 180; }));
     window.findChild<QTimer *>("serialHardwareCheckTimer")->stop();
     window.findChild<QTimer *>("waveformRefreshTimer")->stop();
-    QCheckBox *automatic = nullptr, *paused = nullptr, *selectAll = nullptr;
+    auto paused = window.findChild<QPushButton *>("btnPausePlot");
+    auto latest = window.findChild<QPushButton *>("btnScrollToLatest");
+    VERIFY(paused && latest && paused->isVisible() && paused->isCheckable() && paused->isChecked());
+    VERIFY(paused->parentWidget() == latest->parentWidget() && paused->geometry().bottom() < latest->y());
+    QCheckBox *automatic = nullptr, *selectAll = nullptr;
     for (auto check : window.findChildren<QCheckBox *>()) {
         if (check->text() == "Y轴自适应") automatic = check;
-        if (check->text() == "暂停绘图") paused = check;
         if (check->text().startsWith("全选/")) selectAll = check;
     }
-    VERIFY(automatic && paused && selectAll); automatic->setChecked(false); paused->setChecked(true);
+    VERIFY(automatic && selectAll); automatic->setChecked(false);
     VERIFY(QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({1, 2}))));
     auto mainDock = window.findChild<QDockWidget *>(QStringLiteral("PlotDock_主视图")); VERIFY(mainDock);
     auto main = mainDock->findChild<QCustomPlot *>(); VERIFY(main && main->graphCount() == 2);
@@ -187,8 +228,21 @@ static int plotReadoutUiTests() {
     auto detached = detachedDock->findChild<QCustomPlot *>(); VERIFY(detached && detached->graphCount() == 1);
     VERIFY(until([&] { return detached->isVisible() && detached->height() > 120; }));
 
+    const auto pauseButtonFill = [&] {
+        const QImage image = paused->grab().toImage();
+        return image.pixelColor(image.width() / 10, image.height() / 2);
+    };
     for (auto theme : {ThemeManager::DarkTheme, ThemeManager::LightTheme}) {
         ThemeManager::applyTheme(qApp, theme); QCoreApplication::processEvents();
+        const bool dark = theme == ThemeManager::DarkTheme;
+        VERIFY(paused->text() == "继续绘图（已暂停）" && !paused->icon().isNull());
+        VERIFY(pauseButtonFill() == QColor(dark ? "#68431c" : "#85530f"));
+        const auto resumeIcon = paused->icon().cacheKey();
+        paused->click();
+        VERIFY(!paused->isChecked() && paused->text() == "暂停绘图" && !paused->icon().isNull() && paused->icon().cacheKey() != resumeIcon);
+        VERIFY(pauseButtonFill() == QColor(dark ? "#214b42" : "#236954"));
+        paused->click();
+        VERIFY(paused->isChecked() && paused->icon().cacheKey() == resumeIcon);
         for (auto plot : {main, detached}) {
             // Peaks/troughs at all four corners.
             for (const QPointF point : {QPointF(.02, 99.9), QPointF(9.98, 99.9), QPointF(.02, .1), QPointF(9.98, .1)}) {
@@ -244,7 +298,10 @@ static int plotReadoutUiTests() {
     selectAll->setChecked(true); VERIFY(main->graph(0)->visible() && main->graph(1)->visible() && detached->graph(0)->visible());
     selectAll->setChecked(false); VERIFY(!main->graph(0)->visible() && !main->graph(1)->visible() && detached->graph(0)->visible());
     const int mainCount = main->graph(0)->dataCount(), detachedCount = detached->graph(0)->dataCount();
-    paused->setChecked(false);
+    VERIFY(QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({16, 22}))));
+    VERIFY(QMetaObject::invokeMethod(&window, "onPlotTimer"));
+    VERIFY(main->graph(0)->dataCount() == mainCount && detached->graph(0)->dataCount() == detachedCount);
+    paused->click();
     VERIFY(QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({17, 23}))));
     VERIFY(QMetaObject::invokeMethod(&window, "onPlotTimer"));
     VERIFY(main->graph(0)->dataCount() == mainCount + 1 && detached->graph(0)->dataCount() == detachedCount + 1);

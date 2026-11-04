@@ -1,5 +1,6 @@
 #pragma once
 #include "commandswitchconfig.h"
+#include "panellayout.h"
 #include <QJsonDocument>
 #include <QFile>
 #include <QFileInfo>
@@ -13,6 +14,23 @@
 // transactions. Compatibility must never depend on which route loaded a file.
 namespace CommandPanelConfig {
 constexpr int MaxBytes = 16 * 1024 * 1024;
+
+inline bool readLayout(const QJsonObject &panel, PanelLayout::Layout &layout, QString &error)
+{
+    const auto value = panel.value("layoutRows");
+    if (value.isUndefined()) {
+        layout.reset();
+        return true;
+    }
+    QVector<PanelLayout::Item> items;
+    for (const auto &entry : panel.value("commands").toArray()) {
+        const auto command = entry.toObject();
+        items.append({command["id"].toString(), {}, command["widgetType"].toInt() == 1});
+    }
+    const int limit = panel.contains("columns") ? qBound(1, panel.value("columns").toInt(), PanelLayout::CommandMaxColumns) : 3;
+    return PanelLayout::read(value, items, limit, layout, error);
+}
+
 inline bool decode(const QByteArray &bytes, QJsonArray &result, QString &error,
                    QStringList &changes, bool repair = false) {
     if (bytes.size() > MaxBytes) { error = "命令配置超过 16 MB，未加载。"; return false; }
@@ -45,7 +63,13 @@ inline bool decode(const QByteArray &bytes, QJsonArray &result, QString &error,
             }
             commands[c] = command;
         }
-        panel["commands"] = commands; panels[p] = panel;
+        panel["commands"] = commands;
+        PanelLayout::Layout layout;
+        if (!readLayout(panel, layout, error)) {
+            error = QStringLiteral("面板“%1”：%2").arg(panel["name"].toString(), error);
+            return false;
+        }
+        panels[p] = panel;
     }
     result = panels; return true;
 }

@@ -40,13 +40,24 @@ int main(int argc,char **argv){
         auto rich=panel;rich.protocolName="设备专用协议";rich.items[0].converted=true;rich.items[0].note="监视说明";rich.items[0].mappings[1].color="#2c739f";rich.items[0].mappings[1].severity="警告";rich.items[1].textMatches[0].severity="错误";rich.items[1].textMatches[0].note="规则说明";rich.items[1].textSource.caseSensitive=false;rich.items[2].textSource.caseSensitive=false;
         QVector<Panel> roundTrip;auto bytes=encode({rich},error);CHECK(!bytes.isEmpty());CHECK(decode(bytes,roundTrip,error)&&encode(roundTrip,error)==bytes);const auto flattened=flatten(roundTrip);CHECK(roundTrip[0].protocolName==rich.protocolName&&flattened[0].converted&&flattened[0].event.silence[0].value==0&&flattened[1].textMatches[0].severity=="错误");
     }
+    panel.layoutRows = PanelLayout::Rows{{text.id}, {numeric.id, shared.id}};
+    const QJsonArray commandRows{QJsonArray{"start"}, QJsonArray{"stop", "reset"}};
+    const QJsonArray commands{QJsonObject{{"id","start"}}, QJsonObject{{"id","stop"}}, QJsonObject{{"id","reset"}}};
+    const QJsonArray commandPanels{QJsonObject{{"id","commands"},{"name","命令"},{"columns",3},{"commands",commands},{"layoutRows",commandRows}}};
+    CHECK(ProtocolProfileStore::writeFile(command, QJsonDocument(commandPanels).toJson(), error));
     Store statusStore(status);QVector<Panel> loaded;CHECK(statusStore.load(loaded,error));CHECK(statusStore.save({panel},error));
     {QSettings ui(status+".ui.ini",QSettings::IniFormat);ui.setValue("selectedPanel",panel.id);ui.setValue("geometry",QByteArray("geometry"));ui.sync();}
     CHECK(ProtocolConfigTransfer::exportFile(ini,protocols.snapshot(),command,error));QVariantMap values;CHECK(ProtocolConfigTransfer::read(ini,values,error));CHECK(values.contains("StatusPanel/json")&&values["StatusPanel/selectedId"].toString()==panel.id);
     const auto original=read(status);CHECK(!ProtocolConfigTransfer::exportFile(status,protocols.snapshot(),command,error));CHECK(read(status)==original);CHECK(!ProtocolConfigTransfer::exportFile(command+".lock",protocols.snapshot(),command,error));CHECK(!ProtocolConfigTransfer::exportFile(status+".ui.ini",protocols.snapshot(),command,error));
     // Append remaps the protocol, panel, item, shared-source and matching-row IDs.
     CHECK(ProtocolConfigTransfer::apply(values,protocols,0,true,0,command,error,2));Store appended(status);CHECK(appended.load(loaded,error));CHECK(loaded.size()==2&&loaded[1].name=="设备状态_1"&&loaded[1].id!=panel.id);
-    const auto &copy=loaded[1];CHECK(copy.items[0].id!=numeric.id&&copy.items[1].textMatches[0].id!=text.textMatches[0].id);CHECK(copy.items[1].textSource.id==copy.items[2].textSource.id&&copy.items[1].textSource.id!=text.textSource.id);
+    CHECK(loaded[0].layoutRows == panel.layoutRows);
+    CHECK(ProtocolConfigTransfer::apply(values,protocols,-1,false,2,command,error,0));
+    const auto importedCommands = QJsonDocument::fromJson(read(command)).array();
+    CHECK(importedCommands.size()==2 && importedCommands[1].toObject()["layoutRows"].toArray()==commandRows);
+    const auto &copy=loaded[1];
+    CHECK(copy.layoutRows && copy.layoutRows->first().first()==copy.items[1].id && copy.layoutRows->last().first()==copy.items[0].id);
+    CHECK(copy.items[0].id!=numeric.id&&copy.items[1].textMatches[0].id!=text.textMatches[0].id);CHECK(copy.items[1].textSource.id==copy.items[2].textSource.id&&copy.items[1].textSource.id!=text.textSource.id);
     CHECK(copy.items[0].timeoutMs==3000);CHECK(copy.items[0].event.enabled&&copy.items[0].event.displayMs==0&&copy.items[0].event.silence.size()==1&&copy.items[1].event.enabled&&copy.items[1].event.silence[0].text=="PING");
     CHECK(copy.bindingMode==BindingMode::Locked&&copy.protocolId==copy.items[0].protocolId&&copy.protocolShape==copy.items[0].protocolShape);CHECK(copy.items[0].protocolId==protocols.snapshot().shared.id&&copy.items[0].protocolId!=numeric.protocolId);
     for(const auto &p:protocols.snapshot().profiles)if(p.id==copy.items[0].protocolId)CHECK(copy.items[0].protocolShape==StatusMonitoring::Session::structure(protocols.snapshot().shared,p));

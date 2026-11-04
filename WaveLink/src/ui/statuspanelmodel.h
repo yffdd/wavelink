@@ -1,11 +1,14 @@
 #pragma once
 #include "StatusMonitor.h"
+#include "panellayout.h"
 #include <QJsonDocument>
 namespace StatusPanels {
 enum class BindingMode { Legacy, Follow, Locked };
 struct Panel {QString id,name,note;bool enabled=true;int columns=3;QVector<StatusMonitoring::Rule> items;
     BindingMode bindingMode=BindingMode::Legacy;QString protocolId,protocolName;QByteArray protocolShape;
+    PanelLayout::Layout layoutRows;
 };
+QVector<PanelLayout::Item> layoutItems(const Panel &panel);
 // Infer a uniform old binding without discarding mixed legacy bindings. In the
 // new modes item binding fields are mirrors used by the runtime engine.
 void normalizeBinding(Panel &panel);

@@ -370,7 +370,7 @@ private:
     
     // Channel Dock (Right)
     QCheckBox *chkSelectAllChannels;
-    QCheckBox *chkPausePlot;
+    QPushButton *btnPausePlot = nullptr;
     QCheckBox *chkAutoScaleY;
     QCheckBox *chkShowGrid;
     QSpinBox *spinDecimals;
@@ -603,6 +603,8 @@ protected:
 
 private:
     PlotContext createNewPlotContext(const QString &title, bool isMain);
+    QList<QDockWidget *> detachedPlotDocksInDisplayOrder() const;
+    void moveDetachedPlot(QDockWidget *dock, int direction);
     void moveChannelToNewPlot(int chIdx);
     void moveChannelToMainPlot(int chIdx);
     void updatePlotTitle(int plotIdx);

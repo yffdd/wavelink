@@ -1026,10 +1026,10 @@ static int plotInteractionTests() {
     QElapsedTimer layoutReady; layoutReady.start();
     VERIFY(until([&] { return layoutReady.elapsed() > 180; })); // includes deferred layout restore
     window.findChild<QTimer *>("serialHardwareCheckTimer")->stop();
-    QCheckBox *automatic = nullptr, *paused = nullptr;
+    auto paused = window.findChild<QPushButton *>("btnPausePlot");
+    QCheckBox *automatic = nullptr;
     for (auto check : window.findChildren<QCheckBox *>()) {
         if (check->text() == "Y轴自适应") automatic = check;
-        if (check->text() == "暂停绘图") paused = check;
     }
     QDoubleSpinBox *fs = nullptr;
     for (auto spin : window.findChildren<QDoubleSpinBox *>()) if (spin->suffix() == " Hz" && spin->maximum() == 100000) fs = spin;
@@ -1337,14 +1337,18 @@ static int recordingShapeUiTests(OffscreenMessages &messages) {
     auto port = new ReceivePort; auto worker = new TestSerialHandler(port); MainWindow window(nullptr, worker); window.resize(1400, 940); window.show();
     auto open = window.findChild<QPushButton *>("btnOpenClose"); VERIFY(until([&] { return open->isEnabled(); }));
     window.findChild<QTimer *>("serialHardwareCheckTimer")->stop();
-    for (auto check : window.findChildren<QCheckBox *>()) if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通") || check->text() == "暂停绘图" || check->text() == "录前清空") check->setChecked(false);
+    window.findChild<QPushButton *>("btnPausePlot")->setChecked(false);
+    for (auto check : window.findChildren<QCheckBox *>()) if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通") || check->text() == "录前清空") check->setChecked(false);
     auto ports = window.findChild<QComboBox *>("comboPorts"); ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY"); open->click(); VERIFY(until([&] { return open->text().contains("关闭"); }));
     auto record = window.findChild<QPushButton *>("btnToggleRecord"); auto mode = window.findChild<QComboBox *>("comboRecordingMode");
     auto warning = window.findChild<QLabel *>("lblRecordingWarning"); VERIFY(record && mode && warning && warning->isHidden());
+    VERIFY(record->text() == "开始录制" && !record->icon().isNull());
+    const auto recordIcon = record->icon().cacheKey();
     auto packet = [](int channels) { QStringList fields; for (int i = 0; i < channels; ++i) fields << QString::number(i + 1); return "DATA:" + fields.join(',').toUtf8() + "\r\n"; };
     for (int format : {0, 1}) {
         mode->setCurrentIndex(format); messages.lastTitle.clear(); record->click();
-        VERIFY(record->text().contains("停止") && warning->isHidden() && warning->text().isEmpty());
+        VERIFY(record->text() == "停止录制" && warning->isHidden() && warning->text().isEmpty());
+        VERIFY(record->icon().cacheKey() == recordIcon);
         VERIFY(feed(worker, port, packet(12)));
         VERIFY(until([&] { return worker->getLoggedBytes() > 0; }));
         VERIFY(feed(worker, port, packet(17)) && until([&] { return worker->skippedRecordingFrames() == 1; }));
@@ -1353,6 +1357,7 @@ static int recordingShapeUiTests(OffscreenMessages &messages) {
         VERIFY(until([&] { return window.findChildren<QCheckBox *>("chkChannel").size() == 17; }));
         for (auto theme : {ThemeManager::LightTheme, ThemeManager::DarkTheme}) {
             ThemeManager::applyTheme(qApp, theme); QCoreApplication::processEvents(); QCoreApplication::processEvents();
+            VERIFY(record->icon().cacheKey() == recordIcon);
             const auto color = warning->palette().color(QPalette::WindowText); VERIFY(color.red() > color.green() * 1.4 && color.red() > color.blue() * 1.4);
             window.statusBar()->showMessage("临时状态消息", 1000); VERIFY(warning->isVisible());
             if (!artifactDirectory.isEmpty()) window.grab().save(artifactDirectory + QString("/recording-skipped-%1-%2.png").arg(format).arg(theme));
@@ -1360,8 +1365,10 @@ static int recordingShapeUiTests(OffscreenMessages &messages) {
         VERIFY(feed(worker, port, packet(12) + packet(11) + packet(12)) && until([&] { return worker->skippedRecordingFrames() == 2; }));
         VERIFY(until([&] { return warning->text() == "录制中 · 已跳过 2 帧异常数据"; }) && record->text().contains("停止") && messages.lastTitle.isEmpty());
         record->click(); VERIFY(until([&] { return record->text().contains("开始"); }) && warning->isHidden() && warning->text().isEmpty());
+        VERIFY(record->text() == "开始录制" && record->icon().cacheKey() == recordIcon);
         // Start again: use 17 as the NEW fixed width, and count from zero.
         record->click(); VERIFY(record->text().contains("停止") && warning->isHidden() && worker->skippedRecordingFrames() == 0);
+        VERIFY(record->icon().cacheKey() == recordIcon);
         VERIFY(feed(worker, port, packet(17) + packet(12) + packet(17)) && until([&] { return worker->skippedRecordingFrames() == 1; }));
         VERIFY(until([&] { return warning->text() == "录制中 · 已跳过 1 帧异常数据"; }));
         record->click(); VERIFY(until([&] { return record->text().contains("开始"); }) && warning->isHidden());
@@ -1401,7 +1408,8 @@ static int timeRangeSpanTests() {
         settle.restart(); VERIFY(until([&] { return settle.elapsed() > 130; }) && matches());
         VERIFY(std::abs(slider->upperValue() - slider->lowerValue() - 10) < 1e-9);
     }
-    for (auto check : window.findChildren<QCheckBox *>()) if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通") || check->text() == "暂停绘图") check->setChecked(false);
+    window.findChild<QPushButton *>("btnPausePlot")->setChecked(false);
+    for (auto check : window.findChildren<QCheckBox *>()) if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通")) check->setChecked(false);
     auto ports = window.findChild<QComboBox *>("comboPorts"); ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY");
     open->click(); VERIFY(until([&] { return open->text().contains("关闭"); }));
     VERIFY(feed(worker, port, "1,2\n2,3\n3,4\n4,5\n5,6\n"));
@@ -1550,8 +1558,9 @@ static int highFrequencyDemoUiTests() {
     for(auto check:window.findChildren<QCheckBox *>()) {
         if(check->text()=="Y轴自适应") { automatic=check; check->setChecked(true); }
         if(check->text()=="显示接收数据") check->setChecked(false);
-        if(check->text().startsWith("高通") || check->text().startsWith("低通") || check->text().startsWith("陷波") || check->text()=="暂停绘图") check->setChecked(false);
+        if(check->text().startsWith("高通") || check->text().startsWith("低通") || check->text().startsWith("陷波")) check->setChecked(false);
     }
+    window.findChild<QPushButton *>("btnPausePlot")->setChecked(false);
     open->click(); VERIFY(until([&]{return timer->isActive();}));
     // Replay 100 seconds through the real Demo generator/parser, without
     // waiting 100 wall-clock seconds or touching any hardware interface.
@@ -1622,8 +1631,9 @@ static int auditReliabilityUiTests(OffscreenMessages &messages) {
     QCheckBox *hpf = nullptr;
     for (auto check : window.findChildren<QCheckBox *>()) {
         if (check->text().startsWith("高通")) hpf = check;
-        if (check->text().startsWith("陷波") || check->text().startsWith("低通") || check->text() == "暂停绘图") check->setChecked(false);
+        if (check->text().startsWith("陷波") || check->text().startsWith("低通")) check->setChecked(false);
     }
+    window.findChild<QPushButton *>("btnPausePlot")->setChecked(false);
     VERIFY(hpf); hpf->setChecked(false); hpf->setChecked(true);
     auto feed = [&] {
         for (int i = 0; i < 2000; ++i) QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({42,42})));
@@ -2003,7 +2013,8 @@ int main(int argc, char **argv) {
         VERIFY(labels.findChild<QComboBox *>("comboCustomProfile")->currentText() == "CBF/IR/RED");
         VERIFY(until([&] { return labels.findChild<QLabel *>("lblProtocolSummary")->text().contains("已应用"); }));
         labels.findChild<QTimer *>("serialHardwareCheckTimer")->stop();
-        for (auto check : labels.findChildren<QCheckBox *>()) if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通") || check->text() == "暂停绘图") check->setChecked(false);
+        labels.findChild<QPushButton *>("btnPausePlot")->setChecked(false);
+        for (auto check : labels.findChildren<QCheckBox *>()) if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通")) check->setChecked(false);
         // This project-specific protocol normally selects a TCP server. Test
         // its decoder and display without binding the user's default port.
         AMU4Parser parser; QVector<double> decoded;
@@ -2069,7 +2080,8 @@ int main(int argc, char **argv) {
         VERIFY(until([&] { return open->isEnabled() && summary->text().contains("已应用"); }));
         VERIFY(plain.findChild<QComboBox *>("comboInterface")->currentData().toInt() == 0 && summary->text().contains("多通道键值"));
         plain.findChild<QTimer *>("serialHardwareCheckTimer")->stop();
-        for (auto check : plain.findChildren<QCheckBox *>()) if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通") || check->text() == "暂停绘图") check->setChecked(false);
+        plain.findChild<QPushButton *>("btnPausePlot")->setChecked(false);
+        for (auto check : plain.findChildren<QCheckBox *>()) if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通")) check->setChecked(false);
         auto ports = plain.findChild<QComboBox *>("comboPorts"); ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY");
         open->click(); VERIFY(until([&] { return open->text().contains("关闭"); }));
         VERIFY(feed(worker, port, "2:33\r\n0:11\r\n1:22\r\n"));

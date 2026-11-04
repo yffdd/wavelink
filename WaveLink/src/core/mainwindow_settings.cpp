@@ -296,7 +296,7 @@ void MainWindow::saveConfig()
     // Channel Dock
     settings.setValue("chkAutoScaleY", chkAutoScaleY->isChecked());
     settings.setValue("spinDecimals", spinDecimals->value());
-    settings.setValue("chkPausePlot", chkPausePlot->isChecked());
+    settings.setValue("chkPausePlot", btnPausePlot->isChecked());
     settings.setValue("spinPlotHistoryLimit", spinPlotHistoryLimit->value());
     settings.setValue("filterPanelVisible",
                       filterPanelAction ? filterPanelAction->isChecked() : true);
@@ -453,7 +453,7 @@ void MainWindow::loadConfig()
     // Channel Dock
     chkAutoScaleY->setChecked(settings.value("chkAutoScaleY", true).toBool());
     spinDecimals->setValue(settings.value("spinDecimals", 2).toInt());
-    chkPausePlot->setChecked(settings.value("chkPausePlot", false).toBool());
+    btnPausePlot->setChecked(settings.value("chkPausePlot", false).toBool());
     spinPlotHistoryLimit->setValue(
         settings.value("spinPlotHistoryLimit",
                        settings.value("PlotHistoryLimitMB", 64)).toInt());

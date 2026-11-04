@@ -68,8 +68,8 @@ static int scopeMeasurementUiTests() {
         if (timer->objectName() == "serialHardwareCheckTimer" || timer->objectName() == "waveformRefreshTimer") timer->stop();
     for (auto check : window.findChildren<QCheckBox *>()) {
         if (check->text() == "Y轴自适应") check->setChecked(false);
-        if (check->text() == "暂停绘图") check->setChecked(true);
     }
+    window.findChild<QPushButton *>("btnPausePlot")->setChecked(true);
     VERIFY(QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({0, 0}))));
     auto dock = window.findChild<QDockWidget *>(QStringLiteral("PlotDock_主视图")); VERIFY(dock);
     auto main = dock->findChild<QCustomPlot *>(); VERIFY(main && main->graphCount() == 2);

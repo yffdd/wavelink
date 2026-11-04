@@ -15,6 +15,10 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QElapsedTimer>
+#include <QDialogButtonBox>
+#include <QComboBox>
+#include <QSpinBox>
+#include "commandpanelconfig.h"
 #include <QThread>
 #include <QMap>
 #include <QTextBrowser>
@@ -424,6 +428,163 @@ int main(int argc, char **argv)
         QElapsedTimer settle;settle.start();while(settle.elapsed()<300){QApplication::processEvents();QThread::msleep(2);}
         auto current=selectedContent(window);VERIFY(current);auto buttons=current->findChildren<CommandButton*>();auto scroll=current->findChild<QScrollArea*>("commandPanelScroll");VERIFY(buttons.size()==3&&scroll);
         const int row=buttons[0]->y();for(auto button:buttons){VERIFY(button->width()==200&&button->y()==row);VERIFY(button->geometry().right()<scroll->viewport()->width());}
+    }
+    {
+        // A custom layout can omit the remaining columns of a row and still
+        // reserve a separate full-width row for a command slider.
+        auto definition = panel("custom-rows", "自定义命令", true);
+        auto commands = definition["commands"].toArray();
+        const QJsonValue slider = commands.at(1);
+        commands = QJsonArray{};
+        for (int i = 0; i < 8; ++i)
+            commands.append(QJsonObject{{"id", QString::number(i)}, {"name", QString("命令 %1").arg(i)}, {"payload", "TEST"}});
+        commands.append(slider);
+        definition["commands"] = commands;
+        definition["columns"] = 3;
+        const PanelLayout::Rows initial{{"0"}, {"1", "2", "3"}, {"4", "5"}, {"6", "7"}, {"slider-id"}};
+        PanelLayout::write(definition, initial);
+
+        // Exercise the styled scroll area's deferred child visibility.
+        const auto originalStyle = app.styleSheet();
+        app.setStyleSheet("QDialog { background-color: #1e1e1e; }"
+                          "QWidget { color: #dddddd; }"
+                          "QScrollArea { background-color: #1e1e1e; border: none; }"
+                          "QScrollArea > QWidget > QWidget { background-color: #1e1e1e; }"
+                          "QPushButton { background-color: #333333; color: #ffffff; border: 1px solid #555555; padding: 5px; }");
+        CommandPanelWindow window;
+        window.resize(1000, 700);
+        window.show();
+        int layoutSends = 0;
+        QObject::connect(&window, &CommandPanelWindow::sendDataRequested, [&] { ++layoutSends; });
+        VERIFY(window.loadConfigFromString(QJsonDocument(QJsonArray{definition}).toJson()));
+        auto current = selectedContent(window);
+        VERIFY(current && current->getDef().layoutRows == initial);
+        auto edit = current->findChild<QPushButton *>("commandEditLayout");
+        VERIFY(edit && edit->isVisible());
+        bool editorChecked = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog) return;
+            dialog->resize(1800, 1200);
+            QCoreApplication::processEvents();
+            const auto content = dialog->findChild<QWidget *>("panelLayoutContent");
+            const auto mode = dialog->findChild<QComboBox *>("panelLayoutMode");
+            const auto modeLabel = dialog->findChild<QLabel *>("panelLayoutModeLabel");
+            const auto columnsLabel = dialog->findChild<QLabel *>("panelLayoutColumnsLabel");
+            const auto hint = dialog->findChild<QLabel *>("panelLayoutHint");
+            const auto rowLabel = dialog->findChild<QLabel *>("panelLayoutRowLabel");
+            const auto columns = dialog->findChild<QSpinBox *>("panelLayoutColumns");
+            const auto frames = dialog->findChildren<QFrame *>("panelLayoutRowFrame");
+            const auto rows = dialog->findChildren<QListWidget *>("panelLayoutRow");
+            const auto down = dialog->findChildren<QPushButton *>("panelLayoutRowDown");
+            editorChecked = dialog->objectName() == "commandLayoutEditor" && rows.size() == 5 &&
+                            rows[1]->count() == 3 && rows[4]->item(0)->text().contains("滑条") &&
+                            rows[4]->item(0)->sizeHint().width() > rows[1]->item(0)->sizeHint().width() &&
+                            !down.last()->isEnabled() &&
+                            content && content->width() <= 1160 && content->x() > 16 &&
+                            mode && mode->font().bold() && mode->font().pointSizeF() >= 13 &&
+                            modeLabel && modeLabel->font().pointSizeF() == mode->font().pointSizeF() &&
+                            columnsLabel && columnsLabel->font().pointSizeF() == mode->font().pointSizeF() &&
+                            hint && hint->font().pointSizeF() >= 12 &&
+                            rowLabel && rowLabel->font().pointSizeF() == hint->font().pointSizeF() &&
+                            columns && columns->value() == 3 && columns->maximum() == 10 &&
+                            frames.size() == 5 && frames.first()->height() < 150 &&
+                            frames.last()->y() + frames.last()->height() < 720 &&
+                            rows.first()->font().pointSizeF() >= 12;
+            if (!editorChecked) {
+                std::cerr << "Layout editor geometry: rows=" << rows.size() << " controls=" << down.size();
+                if (content) std::cerr << " content=" << content->x() << "/" << content->width();
+                if (mode) std::cerr << " modeFont=" << mode->font().pointSizeF() << "/" << mode->font().bold();
+                if (columns) std::cerr << " columns=" << columns->value() << "/" << columns->maximum();
+                if (!frames.isEmpty()) std::cerr << " firstHeight=" << frames.first()->height() << " lastBottom="
+                                                << frames.last()->geometry().bottom();
+                if (!rows.isEmpty()) std::cerr << " rowFont=" << rows.first()->font().pointSizeF();
+                if (rows.size() == 5 && rows[1]->count() && rows[4]->count())
+                    std::cerr << " widths=" << rows[1]->item(0)->sizeHint().width() << "/" << rows[4]->item(0)->sizeHint().width();
+                std::cerr << "\n";
+            }
+            if (editorChecked) {
+                const auto previewShowsAll = [dialog](int expectedRows) {
+                    QCoreApplication::processEvents();
+                    auto preview = dialog->findChild<QScrollArea *>();
+                    if (!preview) return false;
+                    int visibleRows = 0;
+                    for (auto row : preview->widget()->findChildren<QFrame *>("panelLayoutRowFrame")) {
+                        if (!row->isVisible()) continue;
+                        ++visibleRows;
+                        const int bottom = row->mapTo(preview->viewport(), QPoint(0, row->height())).y();
+                        auto label = row->findChild<QLabel *>("panelLayoutRowLabel");
+                        if (bottom > preview->viewport()->height() || !label || label->font().pointSizeF() < 12)
+                            return false;
+                    }
+                    return visibleRows == expectedRows;
+                };
+
+                const int rowHeight = frames.first()->sizeHint().height();
+                down.first()->click();
+                columns->setValue(4);
+                const bool customAfterChange = previewShowsAll(5);
+                mode->setCurrentIndex(0);
+                const bool autoAfterSwitch = previewShowsAll(3);
+                columns->setValue(3);
+                const bool autoAfterChange = previewShowsAll(4);
+                dialog->resize(850, 470);
+                QCoreApplication::processEvents();
+                auto preview = dialog->findChild<QScrollArea *>();
+                const bool canScroll = preview && preview->viewport()->height() > rowHeight &&
+                                       preview->verticalScrollBar()->maximum() > 0;
+                dialog->resize(1800, 1200);
+                columns->setValue(4);
+                mode->setCurrentIndex(1);
+                const bool customAfterSwitch = previewShowsAll(5);
+                editorChecked = customAfterChange && autoAfterSwitch && autoAfterChange && canScroll && customAfterSwitch;
+                if (!editorChecked) std::cerr << "Layout preview clips rows after changing columns or mode\n";
+            }
+            if (editorChecked) dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Save)->click();
+            else dialog->reject();
+        });
+        edit->click();
+        auto expected = initial;
+        expected.swapItemsAt(0, 1);
+        VERIFY(editorChecked && layoutSends == 0 && current->getDef().layoutRows == expected && current->getDef().columns == 4);
+        bool settingsSynced = false;
+        QTimer::singleShot(0, &window, [&] {
+            auto dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog) return;
+            auto columns = dialog->findChild<QSpinBox *>("commandPanelColumns");
+            settingsSynced = columns && columns->value() == 4;
+            dialog->reject();
+        });
+        current->openPanelSettings();
+        VERIFY(settingsSynced);
+        window.reloadConfig();
+        QCoreApplication::processEvents();
+        current = selectedContent(window);
+        VERIFY(current && current->getDef().layoutRows == expected && current->getDef().columns == 4);
+        QHash<QString, CommandButton *> widgets;
+        for (auto button : current->findChildren<CommandButton *>()) widgets.insert(button->getDef().id, button);
+        VERIFY(widgets.size() == 9 && widgets["1"]->y() == widgets["3"]->y() && widgets["0"]->y() > widgets["3"]->y());
+        VERIFY(widgets["slider-id"]->y() > widgets["7"]->y() && widgets["slider-id"]->width() > 3 * widgets["0"]->width());
+        window.resize(680, 600);
+        QElapsedTimer settle;
+        settle.start();
+        while (settle.elapsed() < 200) { QCoreApplication::processEvents(); QThread::msleep(2); }
+        auto scroll = current->findChild<QScrollArea *>("commandPanelScroll");
+        VERIFY(scroll->horizontalScrollBar()->maximum() > 0 && widgets["1"]->y() == widgets["3"]->y());
+        const auto list = window.findChild<QListWidget *>("commandPanelList");
+        VERIFY(chooseSidebarActionAt(window, list, list->visualItemRect(list->item(0)).center(),
+                                     "commandPanelListMenu", "commandPanelMenuCopy"));
+        const auto copy = selectedContent(window)->getDef();
+        VERIFY(copy.layoutRows && copy.layoutRows->first().size() == 3 && copy.layoutRows->first().first() == copy.commands[1].id);
+        VERIFY(copy.layoutRows->last().first() == copy.commands.last().id && copy.commands.last().id != "slider-id");
+
+        QJsonArray decoded;
+        QString error;
+        QStringList notices;
+        definition["layoutRows"] = QJsonArray{QJsonArray{"0", "slider-id"}};
+        VERIFY(!CommandPanelConfig::decode(QJsonDocument(QJsonArray{definition}).toJson(), decoded, error, notices));
+        VERIFY(layoutSends == 0);
+        app.setStyleSheet(originalStyle);
     }
     VERIFY(sends == 0);
     std::cout << "Command panel blank/item menus, all/current exports, copying, themes, full contents, safe timers, remembered IDs and first-panel fallback passed.\n";

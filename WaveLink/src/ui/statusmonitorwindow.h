@@ -25,10 +25,11 @@ private:
     ContextProvider m_context;ApplyRules m_apply;StatusPanels::Store m_store;
     QVector<StatusPanels::Panel> m_panels;QVector<Card> m_cards;QVector<StatusMonitoring::Event> m_history;
     QListWidget *m_list;QLabel *m_title,*m_note,*m_banner,*m_origin,*m_empty;QScrollArea *m_scroll;QWidget *m_cardBody;QGridLayout *m_grid;QTableWidget *m_events;
-    QPushButton *m_panelToggle;
+    QPushButton *m_panelToggle, *m_editLayout;
     bool m_dark=false,m_rebuilding=false;int m_columns=0;QString m_selected;StatusMonitoring::Session *m_lastSession=nullptr;
     quint64 m_historyRevision=0,m_renderedRevision=~quint64(0);QString m_filter;
     int selectedIndex() const;void rebuildList(const QString &selection={});void rebuildCards();void layoutCards();void refresh();
+    void editLayout();
     void addPanel();void editPanel();void deletePanel();void copyPanel();void movePanel(int direction);
     void reorderItem(const QString &source,const QString &target);
     void toggleItem(const QString &id);

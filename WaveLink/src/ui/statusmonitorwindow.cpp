@@ -1,5 +1,6 @@
 #include "statusmonitorwindow.h"
 #include "paneluistyle.h"
+#include "panellayouteditor.h"
 #include <QSplitter>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -55,7 +56,7 @@ protected:
     void mouseDoubleClickEvent(QMouseEvent *e)override{mousePressEvent(e);}
     void mouseReleaseEvent(QMouseEvent *e)override{if(e->button()==Qt::RightButton){hold.stop();const bool open=rightPressed&&!longPress&&rect().contains(e->pos());rightPressed=false;e->accept();if(open&&menu){auto callback=menu;const auto pos=e->globalPos();QTimer::singleShot(0,window(),[callback,pos]{callback(pos);});}return;}if(e->button()==Qt::LeftButton){const bool click=leftPressed&&!dragged&&rect().contains(e->pos());leftPressed=false;e->accept();if(click&&toggle){auto callback=toggle;QTimer::singleShot(0,window(),callback);}return;}QFrame::mouseReleaseEvent(e);}
     void contextMenuEvent(QContextMenuEvent *e)override{e->accept();if(e->reason()==QContextMenuEvent::Keyboard&&menu){auto callback=menu;const auto pos=mapToGlobal(rect().center());QTimer::singleShot(0,window(),[callback,pos]{callback(pos);});}}
-    void mouseMoveEvent(QMouseEvent *e)override{if(rightPressed&&(e->pos()-pressed).manhattanLength()>=QApplication::startDragDistance()){hold.stop();rightPressed=false;}if(leftPressed&&!dragged&&(e->buttons()&Qt::LeftButton)&&(e->pos()-pressed).manhattanLength()>=QApplication::startDragDistance()){dragged=true;auto drag=new QDrag(window());auto data=new QMimeData;data->setData("application/x-wavelink-status-item",id.toUtf8());drag->setMimeData(data);drag->exec(Qt::MoveAction);drag->deleteLater();return;}QFrame::mouseMoveEvent(e);}
+    void mouseMoveEvent(QMouseEvent *e)override{if(rightPressed&&(e->pos()-pressed).manhattanLength()>=QApplication::startDragDistance()){hold.stop();rightPressed=false;}if(leftPressed&&!dragged&&(e->buttons()&Qt::LeftButton)&&(e->pos()-pressed).manhattanLength()>=QApplication::startDragDistance()){dragged=true;if(!acceptDrops())return;auto drag=new QDrag(window());auto data=new QMimeData;data->setData("application/x-wavelink-status-item",id.toUtf8());drag->setMimeData(data);drag->exec(Qt::MoveAction);drag->deleteLater();return;}QFrame::mouseMoveEvent(e);}
     void dragEnterEvent(QDragEnterEvent *e)override{if(e->mimeData()->hasFormat("application/x-wavelink-status-item"))e->acceptProposedAction();}
     void dropEvent(QDropEvent *e)override{if(e->mimeData()->hasFormat("application/x-wavelink-status-item")){const auto source=QString::fromUtf8(e->mimeData()->data("application/x-wavelink-status-item"));e->acceptProposedAction();if(drop){auto callback=drop;QTimer::singleShot(0,window(),[callback,source]{callback(source);});}}}
 };
@@ -74,7 +75,13 @@ StatusMonitorWindow::StatusMonitorWindow(ContextProvider context,ApplyRules appl
     add->setToolTip("新增状态面板；同名时自动添加 _1、_2 等后缀。");del->setToolTip("删除当前选中面板及其监视项，需要确认，不向设备发送命令。");imp->setToolTip("从 JSON 文件追加或覆盖状态面板。");exp->setToolTip("将全部状态面板导出为一个 JSON 文件。");help->setToolTip("查看数值与文本监视的配置方法和适用边界。");repair->setToolTip("恢复上一份有效配置，恢复前另存当前原文件；可能撤销最近一次修改。");
     connect(add,&QPushButton::clicked,this,&StatusMonitorWindow::addPanel);connect(del,&QPushButton::clicked,this,&StatusMonitorWindow::deletePanel);connect(imp,&QPushButton::clicked,this,&StatusMonitorWindow::importPanels);connect(exp,&QPushButton::clicked,this,[this]{exportPanels(true);});connect(help,&QPushButton::clicked,this,&StatusMonitorWindow::showHelp);
     connect(repair,&QPushButton::clicked,this,[this]{QString error;QVector<Panel> recovered;if(!m_store.restoreBackup(recovered,error)){report(error);return;}m_panels=recovered;m_banner->setText("已恢复有效备份；恢复前的原文件已单独保留。");m_banner->show();m_apply(flatten(m_panels),error);rebuildList();});
-    auto right=new QWidget;split->addWidget(right);auto rl=new QVBoxLayout(right);rl->setContentsMargins(0,0,0,0);auto top=new QHBoxLayout;rl->addLayout(top);m_title=new QLabel("状态监视");m_title->setObjectName("statusPanelTitle");auto titleFont=font();titleFont.setPointSizeF(font().pointSizeF()+3);titleFont.setBold(true);m_title->setFont(titleFont);top->addWidget(m_title,1);m_panelToggle=new QPushButton;m_panelToggle->setObjectName("statusPanelToggle");m_panelToggle->setCheckable(true);m_panelToggle->setToolTip("启用或停用当前面板全部监视；保留各监视项原本的启停设置，不影响设备连接与录制。与面板设置同步。");top->addWidget(m_panelToggle);connect(m_panelToggle,&QPushButton::clicked,this,[this](bool checked){int p=selectedIndex();if(p<0)return;auto candidate=m_panels;candidate[p].enabled=checked;QString error;if(!replacePanels(candidate,error)){rebuildCards();report(error);}});auto newItem=new QPushButton("＋ 新增监视项");newItem->setObjectName("statusAddItem");newItem->setStyleSheet("QPushButton {background:#147caf;color:white;padding:7px;border-radius:3px;}");auto settings=new QPushButton("面板设置");top->addWidget(newItem);top->addWidget(settings);connect(newItem,&QPushButton::clicked,this,[this]{editItem();});connect(settings,&QPushButton::clicked,this,&StatusMonitorWindow::editPanel);
+    auto right=new QWidget;split->addWidget(right);auto rl=new QVBoxLayout(right);rl->setContentsMargins(0,0,0,0);auto top=new QHBoxLayout;rl->addLayout(top);m_title=new QLabel("状态监视");m_title->setObjectName("statusPanelTitle");auto titleFont=font();titleFont.setPointSizeF(font().pointSizeF()+3);titleFont.setBold(true);m_title->setFont(titleFont);top->addWidget(m_title,1);m_panelToggle=new QPushButton;m_panelToggle->setObjectName("statusPanelToggle");m_panelToggle->setCheckable(true);m_panelToggle->setToolTip("启用或停用当前面板全部监视；保留各监视项原本的启停设置，不影响设备连接与录制。与面板设置同步。");top->addWidget(m_panelToggle);connect(m_panelToggle,&QPushButton::clicked,this,[this](bool checked){int p=selectedIndex();if(p<0)return;auto candidate=m_panels;candidate[p].enabled=checked;QString error;if(!replacePanels(candidate,error)){rebuildCards();report(error);}});auto newItem=new QPushButton("＋ 新增监视项");newItem->setObjectName("statusAddItem");newItem->setStyleSheet("QPushButton {background:#147caf;color:white;padding:7px;border-radius:3px;}");auto settings=new QPushButton("面板设置");top->addWidget(newItem);
+    m_editLayout = new QPushButton(QStringLiteral("编辑布局"));
+    m_editLayout->setObjectName("statusEditLayout");
+    m_editLayout->setToolTip(QStringLiteral("设置当前面板的自动排列或自定义分行。"));
+    top->addWidget(m_editLayout);
+    connect(m_editLayout, &QPushButton::clicked, this, &StatusMonitorWindow::editLayout);
+    top->addWidget(settings);connect(newItem,&QPushButton::clicked,this,[this]{editItem();});connect(settings,&QPushButton::clicked,this,&StatusMonitorWindow::editPanel);
     m_origin=new QLabel;m_origin->setObjectName("statusSourceSummary");m_origin->setWordWrap(true);rl->addWidget(m_origin);
     newItem->setText("新增监视项");newItem->setToolTip("添加通道数值或接收文本监视规则，可先生成样例进行解析测试。");settings->setObjectName("statusPanelSettings");settings->setToolTip("修改当前面板名称、说明、启用状态和卡片布局。");
     m_title->setWordWrap(true);m_title->setTextFormat(Qt::PlainText);m_origin->setTextFormat(Qt::PlainText);
@@ -100,7 +107,12 @@ bool StatusMonitorWindow::reloadConfig(QString &error){QVector<Panel> panels;if(
 int StatusMonitorWindow::selectedIndex()const {for(int i=0;i<m_panels.size();++i)if(m_panels[i].id==m_selected)return i;return -1;}
 void StatusMonitorWindow::saveUi(){QSettings ui(m_store.path()+".ui.ini",QSettings::IniFormat);ui.setValue("selectedPanel",m_selected);ui.setValue("geometry",saveGeometry());}
 bool StatusMonitorWindow::replacePanels(const QVector<Panel> &panels,QString &error){
-    auto normalized=panels;for(auto &p:normalized)normalizeBinding(p);const auto rules=flatten(normalized);if(!Engine::validate(rules,error)||encode(normalized,error).isEmpty())return false;
+    auto normalized = panels;
+    for (auto &panel : normalized) {
+        normalizeBinding(panel);
+        if (panel.layoutRows) panel.layoutRows = PanelLayout::arrange(layoutItems(panel), panel.columns, *panel.layoutRows);
+    }
+    const auto rules=flatten(normalized);if(!Engine::validate(rules,error)||encode(normalized,error).isEmpty())return false;
     if(!m_store.save(normalized,error))return false;m_panels=normalized;
     if(!m_apply(rules,error)){m_banner->setText("配置已保存，但应用失败："+error);m_banner->show();return false;}
     m_banner->hide();rebuildList(m_selected);return true;
@@ -110,6 +122,7 @@ void StatusMonitorWindow::rebuildList(const QString &selection){m_rebuilding=tru
 void StatusMonitorWindow::rebuildCards(){for(auto &c:m_cards)delete c.frame;m_cards.clear();while(auto item=m_grid->takeAt(0))delete item;int p=selectedIndex();{QSignalBlocker block(m_panelToggle);m_panelToggle->setEnabled(p>=0);m_panelToggle->setChecked(p>=0&&m_panels[p].enabled);m_panelToggle->setText(p<0?"○ 面板未选择":m_panels[p].enabled?"● 面板已启用":"○ 面板已停用");m_panelToggle->setStyleSheet(m_panelToggle->isChecked()?"QPushButton {background:#237b52;color:white;padding:7px;border-radius:3px;}":"QPushButton {background:#596572;color:white;padding:7px;border-radius:3px;}");}m_note->setText(p>=0?m_panels[p].note:"");m_title->setText(p>=0?m_panels[p].name:"状态监视");m_empty->setVisible(p<0||m_panels[p].items.isEmpty());m_empty->setText(p<0?"欢迎使用状态监视\n\n先新增或导入面板，再添加通道数值或接收文本监视。\n关闭此窗口后，已启用监视仍会继续运行。":"此面板尚无监视项。\n点击“新增监视项”开始配置。");
     if(p>=0)for(const auto &r:m_panels[p].items){auto frame=new StatusCard(m_cardBody);frame->id=r.id;frame->edit=[this,id=r.id]{editItem(id);};frame->drop=[this,id=r.id](const QString &source){reorderItem(source,id);};frame->setObjectName("statusCard");frame->setProperty("ruleId",r.id);frame->setFrameShape(QFrame::StyledPanel);frame->setMinimumHeight(118);frame->setMinimumWidth(0);frame->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Preferred);auto layout=new QVBoxLayout(frame);auto title=new QLabel(r.name);title->setObjectName("statusCardTitle");title->setTextFormat(Qt::PlainText);title->setWordWrap(true);auto font=title->font();font.setBold(true);title->setFont(font);auto state=new QLabel("等待数据");state->setTextFormat(Qt::PlainText);state->setWordWrap(true);font.setPointSizeF(font.pointSizeF()+2);state->setFont(font);auto severity=new QLabel(frame);severity->setObjectName("statusSeverity");severity->setTextFormat(Qt::PlainText);severity->setSizePolicy(QSizePolicy::Maximum,QSizePolicy::Preferred);severity->setAttribute(Qt::WA_TransparentForMouseEvents);severity->hide();auto meta=new QLabel;meta->setObjectName("statusCardMeta");meta->setTextFormat(Qt::PlainText);meta->setWordWrap(true);for(auto label:{title,severity,state,meta}){label->setAttribute(Qt::WA_TransparentForMouseEvents);layout->addWidget(label);}auto tip=r.note.isEmpty()?QString("暂无说明"):r.note.left(400);if(r.note.size()>400)tip+="\n…右键可查看完整说明";tip=tip.toHtmlEscaped();tip.replace('\n',"<br>");frame->setToolTip("<qt>"+tip+"</qt>");frame->setContextMenuPolicy(Qt::CustomContextMenu);connect(frame,&QWidget::customContextMenuRequested,this,[this,id=r.id,frame](const QPoint &pos){itemMenu(id,frame->mapToGlobal(pos));});m_cards.append({frame,title,state,meta,severity,r.id});}
     for(auto &card:m_cards){auto frame=static_cast<StatusCard*>(card.frame);frame->setContextMenuPolicy(Qt::DefaultContextMenu);disconnect(frame,&QWidget::customContextMenuRequested,this,nullptr);frame->toggle=[this,id=card.id]{toggleItem(id);};frame->menu=[this,id=card.id](QPoint pos){itemMenu(id,pos);};frame->setToolTip(frame->toolTip()+"<p>左键：启用 / 停用此项；右键：菜单；右键长按：编辑。<br>不影响设备连接及其他监视项。</p>");applyCardTheme(card);}
+    m_editLayout->setEnabled(p >= 0);
     m_columns=0;layoutCards();refresh();}
 void StatusMonitorWindow::applyCardTheme(Card &card){
     const QColor background(m_dark?"#27323c":"#ffffff"),border(m_dark?"#4a6070":"#becbd6"),ink(m_dark?"#e1e8ef":"#1b3548");
@@ -120,7 +133,61 @@ void StatusMonitorWindow::applyCardTheme(Card &card){
     for(auto label:{card.title,card.meta})label->setStyleSheet("QLabel {background:transparent;color:"+ink.name()+";}");
     card.frame->update();
 }
-void StatusMonitorWindow::layoutCards(){int p=selectedIndex();const int columns=qMax(1,qMin(p>=0?m_panels[p].columns:3,m_scroll->viewport()->width()/240));if(columns==m_columns)return;m_columns=columns;while(auto item=m_grid->takeAt(0))delete item;for(int i=0;i<m_cards.size();++i)m_grid->addWidget(m_cards[i].frame,i/columns,i%columns);for(int i=0;i<8;++i)m_grid->setColumnStretch(i,i<columns?1:0);}
+void StatusMonitorWindow::layoutCards()
+{
+    const int p = selectedIndex();
+    const auto rows = p >= 0 && m_panels[p].layoutRows ? &*m_panels[p].layoutRows : nullptr;
+    const int columns = rows ? qMax(1, PanelLayout::widestRow(*rows))
+                             : qMax(1, qMin(p >= 0 ? m_panels[p].columns : 3, m_scroll->viewport()->width() / 240));
+    if (columns == m_columns) return;
+    m_columns = columns;
+    while (auto item = m_grid->takeAt(0)) delete item;
+    m_scroll->setHorizontalScrollBarPolicy(rows ? Qt::ScrollBarAsNeeded : Qt::ScrollBarAlwaysOff);
+    for (int i = 0; i < PanelLayout::StatusMaxColumns; ++i) {
+        m_grid->setColumnStretch(i, i < columns ? 1 : 0);
+        m_grid->setColumnMinimumWidth(i, rows && !rows->isEmpty() && i < columns ? 240 : 0);
+    }
+    if (rows) {
+        QHash<QString, QFrame *> frames;
+        for (const auto &card : m_cards) {
+            card.frame->setAcceptDrops(false);
+            frames.insert(card.id, card.frame);
+        }
+        for (int row = 0; row < rows->size(); ++row) {
+            const auto &ids = rows->at(row);
+            for (int col = 0; col < ids.size(); ++col) m_grid->addWidget(frames.value(ids[col]), row, col);
+        }
+    } else {
+        for (int i = 0; i < m_cards.size(); ++i) {
+            m_cards[i].frame->setAcceptDrops(true);
+            m_grid->addWidget(m_cards[i].frame, i / columns, i % columns);
+        }
+    }
+}
+
+void StatusMonitorWindow::editLayout()
+{
+    const int index = selectedIndex();
+    if (index < 0) return;
+    const auto panel = m_panels[index];
+    PanelLayout::edit(this, PanelLayout::EditorKind::Status, layoutItems(panel), panel.columns, panel.layoutRows,
+        [this, panelId = panel.id](int columns, const PanelLayout::Layout &layout, QString &error) {
+            const int index = selectedIndex();
+            if (index < 0 || m_panels[index].id != panelId) {
+                error = QStringLiteral("当前面板已变更，请重新打开布局编辑器。");
+                return false;
+            }
+            if (m_panels[index].columns == columns && m_panels[index].layoutRows == layout) return true;
+            auto candidate = m_panels;
+            candidate[index].columns = columns;
+            candidate[index].layoutRows = layout;
+            if (!m_store.save(candidate, error)) return false;
+            m_panels = std::move(candidate);
+            m_columns = 0;
+            layoutCards();
+            return true;
+        });
+}
 void StatusMonitorWindow::resizeEvent(QResizeEvent *event){QDialog::resizeEvent(event);if(m_scroll)layoutCards();}
 void StatusMonitorWindow::closeEvent(QCloseEvent *event){saveUi();hide();event->ignore();}
 void StatusMonitorWindow::refresh(){const auto ctx=m_context();if(ctx.session!=m_lastSession){if(m_lastSession){auto events=m_lastSession->takeEvents();m_history+=events;m_historyRevision+=events.size();}m_lastSession=ctx.session;}
@@ -145,8 +212,8 @@ void StatusMonitorWindow::editPanel(){
     QDialog dialog(this);PanelUi::windowControls(&dialog);dialog.setObjectName("statusPanelSettingsDialog");dialog.setWindowTitle("面板设置");dialog.resize(640,680);
     auto root=new QVBoxLayout(&dialog);auto scroll=new QScrollArea;scroll->setWidgetResizable(true);root->addWidget(scroll,1);auto body=new QWidget;scroll->setWidget(body);auto form=new QFormLayout(body);form->setFormAlignment(Qt::AlignTop);form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     auto name=new QLineEdit(m_panels[i].name);name->setMaxLength(1024);auto note=new QPlainTextEdit(m_panels[i].note);note->setObjectName("statusPanelDescriptionEdit");note->setPlaceholderText("填写面板用途、设备说明或监视约定；仅用于说明，不参与解析。");note->setMinimumHeight(90);
-    auto enabled=new QCheckBox("启用此面板");enabled->setObjectName("statusPanelEnabled");enabled->setChecked(m_panels[i].enabled);auto columns=new QSpinBox;columns->setRange(1,8);columns->setValue(m_panels[i].columns);
-    form->addRow("面板名称",name);form->addRow("说明",note);form->addRow("启用",enabled);form->addRow("最多列数（窄窗自动减少）",columns);
+    auto enabled=new QCheckBox("启用此面板");enabled->setObjectName("statusPanelEnabled");enabled->setChecked(m_panels[i].enabled);auto columns=new QSpinBox;columns->setObjectName("statusPanelColumns");columns->setRange(1,PanelLayout::StatusMaxColumns);columns->setValue(m_panels[i].columns);
+    form->addRow("面板名称",name);form->addRow("说明",note);form->addRow("启用",enabled);form->addRow("每行最多列数",columns);
     auto binding=new StatusPanelBindingEditor(m_panels[i],m_context(),body);form->addRow(binding);
     auto buttons=new QDialogButtonBox(QDialogButtonBox::Save|QDialogButtonBox::Cancel);buttons->button(QDialogButtonBox::Save)->setText("保存");buttons->button(QDialogButtonBox::Cancel)->setText("取消");root->addWidget(buttons);
     connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
@@ -155,7 +222,7 @@ void StatusMonitorWindow::editPanel(){
 void StatusMonitorWindow::deletePanel(){int i=selectedIndex();if(i<0)return;QMessageBox box(QMessageBox::Question,"删除状态面板","删除面板 <b>“"+m_panels[i].name.toHtmlEscaped()+"”</b> 及其监视项？\n不会向设备发送命令。",QMessageBox::Yes|QMessageBox::Cancel,this);box.setTextFormat(Qt::RichText);box.button(QMessageBox::Yes)->setText("确认删除");box.button(QMessageBox::Cancel)->setText("取消");if(box.exec()!=QMessageBox::Yes)return;auto candidate=m_panels;candidate.removeAt(i);QString error;if(!replacePanels(candidate,error))report(error);}
 void StatusMonitorWindow::copyPanel(){int i=selectedIndex();if(i<0)return;auto candidate=m_panels;auto copy=duplicate(candidate[i]);const auto base=candidate[i].name;int suffix=1;for(;;){bool found=false;for(const auto &p:candidate)if(p.name==copy.name)found=true;if(!found)break;copy.name=base+"_"+QString::number(++suffix);}candidate.insert(i+1,copy);QString error;if(!replacePanels(candidate,error)){report(error);return;}rebuildList(copy.id);}
 void StatusMonitorWindow::movePanel(int direction){int i=selectedIndex(),j=i+direction;if(i<0||j<0||j>=m_panels.size())return;auto candidate=m_panels;candidate.swapItemsAt(i,j);QString error;if(!replacePanels(candidate,error))report(error);}
-void StatusMonitorWindow::reorderItem(const QString &source,const QString &target){int p=selectedIndex();if(p<0||source==target)return;int a=-1,b=-1;for(int i=0;i<m_panels[p].items.size();++i){if(m_panels[p].items[i].id==source)a=i;if(m_panels[p].items[i].id==target)b=i;}if(a<0||b<0)return;auto candidate=m_panels;candidate[p].items.move(a,b);QString error;if(!replacePanels(candidate,error))report(error);}
+void StatusMonitorWindow::reorderItem(const QString &source,const QString &target){int p=selectedIndex();if(p<0||m_panels[p].layoutRows||source==target)return;int a=-1,b=-1;for(int i=0;i<m_panels[p].items.size();++i){if(m_panels[p].items[i].id==source)a=i;if(m_panels[p].items[i].id==target)b=i;}if(a<0||b<0)return;auto candidate=m_panels;candidate[p].items.move(a,b);QString error;if(!replacePanels(candidate,error))report(error);}
 void StatusMonitorWindow::listMenu(const QPoint &pos){auto item=m_list->itemAt(pos);if(item)m_list->setCurrentItem(item);QMenu menu;auto add=menu.addAction("新增面板");auto edit=menu.addAction("面板设置 / 重命名");auto copy=menu.addAction("复制面板");auto up=menu.addAction("面板上移");auto down=menu.addAction("面板下移");auto del=menu.addAction("删除面板");menu.addSeparator();auto imp=menu.addAction("导入面板");auto current=menu.addAction("导出当前面板");auto all=menu.addAction("导出所有面板");for(auto a:{edit,copy,up,down,del,current})a->setEnabled(item);all->setEnabled(!m_panels.isEmpty());auto a=menu.exec(m_list->mapToGlobal(pos));if(a==add)addPanel();else if(a==edit)editPanel();else if(a==copy)copyPanel();else if(a==up)movePanel(-1);else if(a==down)movePanel(1);else if(a==del)deletePanel();else if(a==imp)importPanels();else if(a==current)exportPanels(false);else if(a==all)exportPanels(true);}
 void StatusMonitorWindow::toggleItem(const QString &id){
     bool enablePanel=false;
@@ -180,7 +247,7 @@ void StatusMonitorWindow::toggleItem(const QString &id){
 void StatusMonitorWindow::editItem(const QString &id){int p=selectedIndex();if(p<0){report("请先新增或选择面板。");return;}Rule rule;int index=-1;for(int i=0;i<m_panels[p].items.size();++i)if(m_panels[p].items[i].id==id){rule=m_panels[p].items[i];index=i;break;}if(index<0&&!id.isEmpty())return;if(index<0){rule.id=newId();rule.name="新监视项";rule.protocolId=m_panels[p].protocolId;rule.protocolShape=m_panels[p].protocolShape;rule.mappings={{0,"状态0"},{1,"状态1"}};}auto context=m_context();const auto &panel=m_panels[p];context.inheritPanelBinding=panel.bindingMode!=BindingMode::Legacy;context.panelBindingPending=!context.inheritPanelBinding;context.panelProtocolId=panel.protocolId;context.panelProtocolShape=panel.protocolShape;context.panelProtocolName=panel.protocolName;StatusItemDialog editor(rule,panel.items,context,this);const auto panelId=m_panels[p].id;editor.setSaveHandler([this,panelId](const Rule &edited,QString &error){auto candidate=m_panels;for(auto &panel:candidate)if(panel.id==panelId){for(auto &item:panel.items)if(item.id==edited.id){item=edited;return replacePanels(candidate,error);}panel.items.append(edited);return replacePanels(candidate,error);}error="原面板已不存在，无法保存。";return false;});editor.exec();}
 void StatusMonitorWindow::itemMenu(const QString &id,const QPoint &pos){
     int p=selectedIndex();if(p<0)return;int i=-1;for(int k=0;k<m_panels[p].items.size();++k)if(m_panels[p].items[k].id==id)i=k;if(i<0)return;
-    auto original=m_panels[p].items[i];QMenu menu;menu.setObjectName("statusItemMenu");auto enabled=menu.addAction(m_panels[p].enabled&&original.enabled?"停用此监视项":"启用此监视项");enabled->setObjectName("statusToggleItem");enabled->setToolTip("启停此监视项；面板已停用时先确认启用面板，保留其他项原有设置。不断开设备连接。");auto edit=menu.addAction("编辑监视项");QAction *clear=nullptr;if(original.event.enabled){clear=menu.addAction("清除事件提示");clear->setObjectName("statusClearEvent");bool latched=false;auto ctx=m_context();if(ctx.session)for(const auto &s:ctx.session->snapshot())if(s.id==id)latched=s.eventLatched;clear->setEnabled(latched);clear->setToolTip("仅清除本项提示，不清零触发计数，不删除历史，不断开设备。进入匹配状态模式下，持续相同输入不会立即重新触发。");}menu.addSeparator();auto detail=menu.addAction("查看详情 / 说明");auto copy=menu.addAction("复制监视项");auto up=menu.addAction("前移");auto down=menu.addAction("后移");auto value=menu.addAction("复制当前值 / 消息");auto state=menu.addAction("复制当前状态");auto del=menu.addAction("删除监视项");auto a=menu.exec(pos);if(!a)return;
+    auto original=m_panels[p].items[i];QMenu menu;menu.setObjectName("statusItemMenu");auto enabled=menu.addAction(m_panels[p].enabled&&original.enabled?"停用此监视项":"启用此监视项");enabled->setObjectName("statusToggleItem");enabled->setToolTip("启停此监视项；面板已停用时先确认启用面板，保留其他项原有设置。不断开设备连接。");auto edit=menu.addAction("编辑监视项");QAction *clear=nullptr;if(original.event.enabled){clear=menu.addAction("清除事件提示");clear->setObjectName("statusClearEvent");bool latched=false;auto ctx=m_context();if(ctx.session)for(const auto &s:ctx.session->snapshot())if(s.id==id)latched=s.eventLatched;clear->setEnabled(latched);clear->setToolTip("仅清除本项提示，不清零触发计数，不删除历史，不断开设备。进入匹配状态模式下，持续相同输入不会立即重新触发。");}menu.addSeparator();auto detail=menu.addAction("查看详情 / 说明");auto copy=menu.addAction("复制监视项");auto up=menu.addAction("前移");auto down=menu.addAction("后移");up->setEnabled(!m_panels[p].layoutRows&&i>0);down->setEnabled(!m_panels[p].layoutRows&&i+1<m_panels[p].items.size());auto value=menu.addAction("复制当前值 / 消息");auto state=menu.addAction("复制当前状态");auto del=menu.addAction("删除监视项");auto a=menu.exec(pos);if(!a)return;
     if(a==enabled){toggleItem(id);return;}
     if(a==clear){auto ctx=m_context();if(ctx.session)ctx.session->clearEvent(id);refresh();return;}
     if(a==edit){editItem(id);return;}

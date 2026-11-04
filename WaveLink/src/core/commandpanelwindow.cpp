@@ -1,6 +1,7 @@
 #include <QTimer>
 #include <cmath>
 #include "commandpanelwindow.h"
+#include "panellayouteditor.h"
 #include "paneluistyle.h"
 #include "panelcolordialog.h"
 #include "commandsliderconfig.h"
@@ -1894,7 +1895,7 @@ PanelContentWidget::PanelContentWidget(const PanelDef &def, QWidget *parent)
       m_panelId(def.id),
       m_panelName(def.name),
       m_remark(def.remark),
-      m_columns(qBound(1, def.columns, 10)),
+      m_columns(qBound(1, def.columns, PanelLayout::CommandMaxColumns)),
       m_buttonWidth(qBound(100, def.buttonWidth > 0 ? def.buttonWidth : 200, 400)),
       m_buttonHeight(qBound(40, def.buttonHeight > 0 ? def.buttonHeight : 60, 200))
 {
@@ -1924,7 +1925,12 @@ PanelContentWidget::PanelContentWidget(const PanelDef &def, QWidget *parent)
     topLayout->addLayout(headerTextLayout);
     topLayout->addStretch();
 
+    auto btnLayout = new QPushButton(QStringLiteral("编辑布局"), this);
+    btnLayout->setObjectName("commandEditLayout");
+    btnLayout->setToolTip(QStringLiteral("设置自动排列或自定义分行，滑条独占一行。"));
+    connect(btnLayout, &QPushButton::clicked, this, &PanelContentWidget::editLayout);
     topLayout->addWidget(btnSettings);
+    topLayout->addWidget(btnLayout);
     topLayout->addWidget(btnAddCmd);
     
     connect(btnSettings, &QPushButton::clicked, this, &PanelContentWidget::onSettingsClicked);
@@ -1948,9 +1954,9 @@ PanelContentWidget::PanelContentWidget(const PanelDef &def, QWidget *parent)
     connect(btnAddCmd, &QPushButton::clicked, this, &PanelContentWidget::onAddCommand);
 
 
-    for (const auto &cmd : def.commands) {
-        addCommand(cmd);
-    }
+    for (const auto &cmd : def.commands) appendCommandWidget(cmd);
+    m_layoutRows = def.layoutRows;
+    rebuildLayout();
     applyTheme(m_isDark);
 }
 
@@ -1962,6 +1968,7 @@ PanelDef PanelContentWidget::getDef() const {
     def.columns = m_columns;
     def.buttonWidth = m_buttonWidth;
     def.buttonHeight = m_buttonHeight;
+    def.layoutRows = m_layoutRows;
     for (CommandButton *btn : m_buttons) {
         def.commands.append(btn->getDef());
     }
@@ -1991,7 +1998,8 @@ void PanelContentWidget::onSettingsClicked() {
     auto editDescription=new QTextEdit(&dlg);editDescription->setObjectName("commandPanelDescriptionEdit");editDescription->setAcceptRichText(false);editDescription->setPlaceholderText("请输入该命令面板的说明信息。这些信息将保存在面板配置中，不参与命令发送。");editDescription->setPlainText(m_remark);formLayout->addRow("面板说明:",editDescription);
     
     QSpinBox *spinCols = new QSpinBox(&dlg);
-    spinCols->setRange(1, 10);
+    spinCols->setObjectName("commandPanelColumns");
+    spinCols->setRange(1, PanelLayout::CommandMaxColumns);
     spinCols->setValue(m_columns);
     formLayout->addRow("布局列数 (1~10):", spinCols);
 
@@ -2078,8 +2086,8 @@ void PanelContentWidget::onCommandMenuRequested(CommandButton *btn, const QPoint
     menu->addSeparator();
     QAction *previous = menu->addAction(QStringLiteral("命令位置前移"));
     QAction *next = menu->addAction(QStringLiteral("命令位置后移"));
-    previous->setEnabled(index > 0);
-    next->setEnabled(index + 1 < m_buttons.size());
+    previous->setEnabled(!m_layoutRows && index > 0);
+    next->setEnabled(!m_layoutRows && index + 1 < m_buttons.size());
     menu->addSeparator();
     QAction *remove = menu->addAction(QStringLiteral("删除命令"));
     connect(add, &QAction::triggered, this, &PanelContentWidget::onAddCommand);
@@ -2103,7 +2111,7 @@ void PanelContentWidget::onCommandMenuRequested(CommandButton *btn, const QPoint
         copyDef.id = QUuid::createUuid().toString();
         // Duplicating an active command must not start a second transmitter.
         copyDef.autoSend = false;
-        addCommand(copyDef);
+        appendCommandWidget(copyDef);
         m_buttons.move(m_buttons.size() - 1, currentIndex + 1);
         rebuildLayout();
         emit contentChanged();
@@ -2122,12 +2130,20 @@ void PanelContentWidget::onCommandMenuRequested(CommandButton *btn, const QPoint
     menu->popup(globalPos);
 }
 
-void PanelContentWidget::addCommand(const CommandDef &cmdDef)
+void PanelContentWidget::appendCommandWidget(CommandDef def)
 {
-    CommandButton *btn = createCommandWidget(cmdDef, scrollContainer);
+    if (def.id.trimmed().isEmpty() || m_commandIds.contains(def.id))
+        def.id = QUuid::createUuid().toString();
+    m_commandIds.insert(def.id);
+    auto btn = createCommandWidget(def, scrollContainer);
     connectCommandWidget(btn);
     btn->show();
     m_buttons.append(btn);
+}
+
+void PanelContentWidget::addCommand(const CommandDef &cmdDef)
+{
+    appendCommandWidget(cmdDef);
     rebuildLayout();
 }
 void PanelContentWidget::onAddCommand() {
@@ -2146,7 +2162,8 @@ void PanelContentWidget::onAddCommand() {
 void PanelContentWidget::onCommandDeleted(CommandButton *btn)
 {
     if (!btn) return;
-    m_buttons.removeOne(btn);
+    if (!m_buttons.removeOne(btn)) return;
+    m_commandIds.remove(btn->getDef().id);
     btn->deleteLater();
     rebuildLayout();
     emit contentChanged();
@@ -2156,7 +2173,9 @@ void PanelContentWidget::onCommandReplaced(CommandButton *btn, const CommandDef 
 {
     const int index = m_buttons.indexOf(btn);
     if (index < 0) return;
-    CommandButton *replacement = createCommandWidget(def, scrollContainer);
+    CommandDef replacementDef = def;
+    replacementDef.id = btn->getDef().id;
+    CommandButton *replacement = createCommandWidget(replacementDef, scrollContainer);
     connectCommandWidget(replacement);
     replacement->show();
     m_buttons[index] = replacement;
@@ -2165,77 +2184,88 @@ void PanelContentWidget::onCommandReplaced(CommandButton *btn, const CommandDef 
     rebuildLayout();
     emit contentChanged();
 }
+QVector<PanelLayout::Item> PanelContentWidget::layoutItems() const
+{
+    QVector<PanelLayout::Item> items;
+    items.reserve(m_buttons.size());
+    for (auto button : m_buttons) {
+        const auto def = button->getDef();
+        items.append({def.id, def.name, qobject_cast<SliderCommandWidget *>(button) != nullptr});
+    }
+    return items;
+}
+
+void PanelContentWidget::editLayout()
+{
+    PanelLayout::edit(this, PanelLayout::EditorKind::Commands, layoutItems(), m_columns, m_layoutRows,
+        [this](int columns, const PanelLayout::Layout &layout, QString &error) {
+            if (m_columns == columns && m_layoutRows == layout) return true;
+            const int previousColumns = m_columns;
+            const auto previousLayout = m_layoutRows;
+            m_columns = columns;
+            m_layoutRows = layout;
+            if (m_saveLayout && !m_saveLayout(error)) {
+                m_columns = previousColumns;
+                m_layoutRows = previousLayout;
+                return false;
+            }
+            rebuildLayout();
+            return true;
+        });
+}
+
 void PanelContentWidget::rebuildLayout(bool animate)
 {
-    int availableWidth = scrollContainer->parentWidget() ? scrollContainer->parentWidget()->width() : scrollContainer->width();
-    if (availableWidth < 100) availableWidth = 800;
-
-    const int buttonWidth = qBound(100, m_buttonWidth, 400);
-    const int normalHeight = qBound(40, m_buttonHeight, 200);
-    const int sliderWidth = 3 * buttonWidth + 2 * 10;
+    auto scroll = qobject_cast<QScrollArea *>(scrollContainer->parentWidget()->parentWidget());
+    const int viewportWidth = scroll ? scroll->viewport()->width() : scrollContainer->width();
+    const int availableWidth = viewportWidth < 100 ? 800 : viewportWidth;
+    const int buttonWidth = m_buttonWidth;
+    const int normalHeight = m_buttonHeight;
+    const int spacing = 10;
+    const int sliderWidth = 3 * buttonWidth + 2 * spacing;
     const int sliderHeight = 108;
-    const int spacingX = 10;
-    const int spacingY = 10;
-    const int configuredCols = qMax(1, m_columns > 0 ? m_columns : 3);
-    const int visibleCols = qMax(1, (availableWidth - spacingX) / (buttonWidth + spacingX));
+    const auto items = layoutItems();
+    const auto rows = PanelLayout::arrange(items, m_columns, m_layoutRows.value_or(PanelLayout::Rows{}));
+    if (m_layoutRows) m_layoutRows = rows;
+    if (scroll) scroll->setHorizontalScrollBarPolicy(m_layoutRows ? Qt::ScrollBarAsNeeded : Qt::ScrollBarAlwaysOff);
 
-    int rowY = spacingY;
-    int logicalIndex = 0;
-    int contentBottom = spacingY;
-    while (logicalIndex < m_buttons.size()) {
-        CommandButton *first = m_buttons.at(logicalIndex);
-        const bool slider = qobject_cast<SliderCommandWidget*>(first) != nullptr;
-        if (slider) {
-            const QRect target(spacingX, rowY, sliderWidth, sliderHeight);
-            if (first != m_draggedButton) {
-                if (animate && first->pos() != target.topLeft()) {
-                    QPropertyAnimation *anim = new QPropertyAnimation(first, "pos", first);
-                    anim->setDuration(220);
-                    anim->setEndValue(target.topLeft());
-                    anim->start(QAbstractAnimation::DeleteWhenStopped);
-                    first->resize(target.size());
-                } else {
-                    first->setGeometry(target);
-                }
-            }
-            contentBottom = qMax(contentBottom, rowY + sliderHeight + spacingY);
-            rowY += sliderHeight + spacingY;
-            ++logicalIndex;
+    QHash<QString, CommandButton *> buttons;
+    for (int i = 0; i < items.size(); ++i) buttons.insert(items[i].id, m_buttons[i]);
+
+    const int visibleColumns = m_layoutRows ? m_columns
+        : qMax(1, (availableWidth - spacing) / (buttonWidth + spacing));
+    const auto place = [&](CommandButton *button, const QRect &target) {
+        if (button == m_draggedButton) return;
+        if (animate && button->pos() != target.topLeft()) {
+            auto animation = new QPropertyAnimation(button, "pos", button);
+            animation->setDuration(220);
+            animation->setEndValue(target.topLeft());
+            animation->start(QAbstractAnimation::DeleteWhenStopped);
+            button->resize(target.size());
+        } else {
+            button->setGeometry(target);
+        }
+    };
+
+    int y = spacing;
+    int minWidth = m_layoutRows ? 0 : sliderWidth + 2 * spacing;
+    for (const auto &row : rows) {
+        auto first = buttons.value(row.first());
+        if (qobject_cast<SliderCommandWidget *>(first)) {
+            place(first, QRect(spacing, y, sliderWidth, sliderHeight));
+            minWidth = qMax(minWidth, sliderWidth + 2 * spacing);
+            y += sliderHeight + spacing;
             continue;
         }
-
-        int rowEnd = logicalIndex;
-        while (rowEnd < m_buttons.size()
-               && rowEnd < logicalIndex + configuredCols
-               && qobject_cast<SliderCommandWidget*>(m_buttons.at(rowEnd)) == nullptr) {
-            ++rowEnd;
+        for (int i = 0; i < row.size(); ++i) {
+            const int x = spacing + (i % visibleColumns) * (buttonWidth + spacing);
+            const int top = y + (i / visibleColumns) * (normalHeight + spacing);
+            place(buttons.value(row[i]), QRect(x, top, buttonWidth, normalHeight));
         }
-        const int rowCount = rowEnd - logicalIndex;
-        const int visualRows = qMax(1, (rowCount + visibleCols - 1) / visibleCols);
-        for (int offset = 0; offset < rowCount; ++offset) {
-            CommandButton *button = m_buttons.at(logicalIndex + offset);
-            const int visualRow = offset / visibleCols;
-            const int visualCol = offset % visibleCols;
-            const QRect target(spacingX + visualCol * (buttonWidth + spacingX),
-                               rowY + visualRow * (normalHeight + spacingY),
-                               buttonWidth, normalHeight);
-            if (button != m_draggedButton) {
-                if (animate && button->pos() != target.topLeft()) {
-                    QPropertyAnimation *anim = new QPropertyAnimation(button, "pos", button);
-                    anim->setDuration(220);
-                    anim->setEndValue(target.topLeft());
-                    anim->start(QAbstractAnimation::DeleteWhenStopped);
-                    button->resize(target.size());
-                } else {
-                    button->setGeometry(target);
-                }
-            }
-        }
-        contentBottom = qMax(contentBottom, rowY + visualRows * normalHeight + (visualRows + 1) * spacingY);
-        rowY += visualRows * (normalHeight + spacingY);
-        logicalIndex = rowEnd;
+        minWidth = qMax(minWidth, qMin(visibleColumns, row.size()) * (buttonWidth + spacing) + spacing);
+        y += ((row.size() + visibleColumns - 1) / visibleColumns) * (normalHeight + spacing);
     }
-    scrollContainer->setMinimumSize(qMax(availableWidth, sliderWidth + 2 * spacingX), contentBottom);
+    scrollContainer->setMinimumSize(m_layoutRows ? minWidth : qMax(availableWidth, minWidth), y + spacing);
 }
 
 void PanelContentWidget::resizeEvent(QResizeEvent *event) {
@@ -2255,7 +2285,7 @@ void PanelContentWidget::applyTheme(bool isDark) {
         .arg(isDark ? "#333333" : "#ffffff", isDark ? "#dddddd" : "#333333",
              isDark ? "#555555" : "#cccccc", isDark ? "#444444" : "#e0e0e0",
              isDark ? "#222222" : "#d0d0d0");
-    for (const auto name : {"commandPanelSettings", "commandAddCommand"})
+    for (const auto name : {"commandPanelSettings", "commandAddCommand", "commandEditLayout"})
         if (auto button = findChild<QPushButton *>(name)) button->setStyleSheet(actionStyle);
     if (auto scroll = findChild<QScrollArea *>("commandPanelScroll"))
         scroll->viewport()->setStyleSheet(QString("QWidget#commandPanelViewport { background-color: %1; }").arg(isDark ? "#1a1a1a" : "#f0f0f0"));
@@ -2286,6 +2316,7 @@ void PanelContentWidget::forceStopAllTimers() {
 }
 
 void PanelContentWidget::onDragStarted(CommandButton *btn) {
+    if (m_layoutRows) return;
     m_draggedButton = btn;
     m_dragOffset = btn->mapFromGlobal(QCursor::pos());
     btn->raise();
@@ -2828,6 +2859,11 @@ void CommandPanelWindow::setSwitchSendHandler(const std::function<bool(const QBy
 void CommandPanelWindow::addPanelToUI(const PanelDef &panelDef, int index) {
     PanelContentWidget *panel = new PanelContentWidget(panelDef, this);
     panel->setSwitchSendHandler(m_switchSendHandler);
+    panel->m_saveLayout = [this](QString &error) {
+        if (saveConfig(defaultConfigPath)) return true;
+        error = m_configSaveError;
+        return false;
+    };
     connect(panel, &PanelContentWidget::sendRequested, this, &CommandPanelWindow::sendDataRequested);
     connect(panel, &PanelContentWidget::contentChanged, this, &CommandPanelWindow::onContentChanged);
     
@@ -2989,6 +3025,7 @@ bool CommandPanelWindow::loadConfigFromString(const QString &jsonStr, bool appen
             readSwitchConfig(cmdObj, cmdDef);
             def.commands.append(cmdDef);
         }
+        CommandPanelConfig::readLayout(obj, def.layoutRows, error);
         addPanelToUI(def);
     }
     
@@ -3037,6 +3074,7 @@ bool CommandPanelWindow::saveConfig(const QString &filePath) {
         pObj["name"] = pDef.name;
         pObj["remark"] = pDef.remark;
         pObj["columns"] = pDef.columns;
+        PanelLayout::write(pObj, pDef.layoutRows);
         pObj["buttonWidth"] = pDef.buttonWidth;
         pObj["buttonHeight"] = pDef.buttonHeight;
         
@@ -3117,12 +3155,16 @@ void CommandPanelWindow::onCopyPanel(int row) {
     int suffix = 1;
     do { copy.name = base + "_" + QString::number(suffix++); } while (names.contains(copy.name));
     copy.id = QUuid::createUuid().toString();
+    QHash<QString, QString> newIds;
     for (auto &command : copy.commands) {
+        const auto oldId = command.id;
         command.id = QUuid::createUuid().toString();
+        newIds.insert(oldId, command.id);
         // CommandButton starts a timer if autoSend is true in its constructor.
         // A copied panel must never unexpectedly start sending to a device.
         command.autoSend = false;
     }
+    PanelLayout::remap(copy.layoutRows, newIds);
     const int oldSelection = listPanels->currentRow();
     addPanelToUI(copy, row + 1);
     if (!saveConfig(defaultConfigPath)) {
@@ -3206,6 +3248,7 @@ void CommandPanelWindow::onListContextMenu(const QPoint &pos) {
                 pObj["name"] = pDef.name;
                 pObj["remark"] = pDef.remark;
                 pObj["columns"] = pDef.columns;
+                PanelLayout::write(pObj, pDef.layoutRows);
                 pObj["buttonWidth"] = pDef.buttonWidth;
                 pObj["buttonHeight"] = pDef.buttonHeight;
                 
