@@ -1731,7 +1731,7 @@ void MainWindow::onClearPlots()
                 tracer->setGraph(nullptr);
             }
             if (ctx.measureLine) ctx.measureLine->setVisible(false);
-            for (auto text : {ctx.hoverText, ctx.measureText, ctx.measureText2, ctx.measureDeltaText, ctx.heightText, ctx.widthText})
+            for (auto text : {ctx.hoverText, ctx.measureText, ctx.measureText2, ctx.measureDeltaText})
                 if (text) text->setVisible(false);
             for (int g = 0; g < ctx.plot->graphCount(); ++g) {
                 if (ctx.plot->graph(g)) {

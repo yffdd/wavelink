@@ -59,6 +59,16 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
     }
     auto dock = window.findChild<QDockWidget *>(QStringLiteral("PlotDock_主视图")); VERIFY(dock && lowpass);
     auto main = dock->findChild<QCustomPlot *>(); VERIFY(main);
+    const auto spansVisible = [](QCustomPlot *plot) {
+        bool xVisible = false, yVisible = false;
+        for (int i = 0; i < plot->itemCount(); ++i) {
+            auto text = qobject_cast<QCPItemText *>(plot->item(i));
+            if (!text) continue;
+            if (text->text().startsWith("X跨度:")) xVisible = text->visible();
+            if (text->text().startsWith("Y跨度:")) yVisible = text->visible();
+        }
+        return xVisible && yVisible;
+    };
     auto limit = window.findChild<QSpinBox *>("spinPlotHistoryLimit");
     auto usage = window.findChild<QLabel *>("lblPlotHistoryUsage");
     auto slider = window.findChild<RangeSlider *>("timeRangeSlider"); VERIFY(limit && usage && slider && limit->value() == 16);
@@ -91,6 +101,7 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
         messages.lastTitle.clear(); const bool imported = offlineHistoryFileAction(window, path, true);
         if (!imported || messages.lastTitle != "导入成功") std::cerr << "Offline import picked=" << imported << " title=" << messages.lastTitle.toStdString() << " text=" << messages.lastText.toStdString() << '\n';
         VERIFY(imported && messages.lastTitle == "导入成功");
+        VERIFY(spansVisible(main));
         if (paged) {
             VERIFY(messages.lastText.contains("设置 → 系统设置 → 绘图显示 → 离线完整加载上限"));
             VERIFY(messages.lastText.contains("手动调大") && messages.lastText.contains("重新导入"));
@@ -132,6 +143,7 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
         VERIFY(channels && detachPlotTestChannel(window, channels, 0));
         auto separateDock = window.findChild<QDockWidget *>("PlotDock_独立视图: " + names[0]); VERIFY(separateDock);
         auto separate = separateDock->findChild<QCustomPlot *>(); VERIFY(separate && complete(separate->graph(0)));
+        VERIFY(spansVisible(separate));
         VERIFY(choosePlotChannelAction(separate, "添加通道显示", names[1]));
         VERIFY(separate->graphCount() == 2 && complete(separate->graph(0)) && complete(separate->graph(1)));
         lowpass->setChecked(true);
@@ -200,6 +212,7 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
             auto ports = window.findChild<QComboBox *>("comboPorts");
             ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY");
             open->click(); VERIFY(until([&] { return open->text().contains("关闭"); }));
+            VERIFY(spansVisible(main) && spansVisible(separate));
             VERIFY(!playback->isEnabled() && playback->icon().cacheKey() == playIcon);
             for (auto plot : {main, separate}) for (int ch = 0; ch < plot->graphCount(); ++ch) {
                 auto graph = dynamic_cast<WaveformGraph *>(plot->graph(ch));
@@ -270,6 +283,7 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
 
     // Clearing/leaving offline mode restores the bounded real-time policy.
     VERIFY(QMetaObject::invokeMethod(&window, "onClearPlots"));
+    VERIFY(spansVisible(main));
     VERIFY(!usage->text().contains("离线波形") && !usage->text().contains("完整保留"));
     QVector<QCPGraphData> live; live.reserve(Rows);
     for (int i = 0; i < Rows; ++i) live.append({i / Rate, double(i)});
