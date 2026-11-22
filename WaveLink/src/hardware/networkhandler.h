@@ -15,6 +15,7 @@
 #include <atomic>
 #include <QElapsedTimer>
 #include <QMutex>
+#include <QTimer>
 
 class NetworkHandler : public QObject
 {
@@ -28,7 +29,7 @@ public:
 
     bool isConnected() const;
     qint64 getLoggedBytes() const;
-    bool enqueueData(const QByteArray &data);
+    bool enqueueData(const QByteArray &data, quint64 expectedSession = 0);
     qint64 pendingSendBytes() const { QMutexLocker lock(&m_sendMutex); return m_pendingSendBytes; }
     bool sendReady() const { QMutexLocker lock(&m_sendMutex); return m_sendReady; }
     qint64 getRxCount() const { return m_rxCount.load(); }
@@ -55,8 +56,9 @@ signals:
     void textReady(const QByteArray &text);
     void channelsUpdated(const QVector<double> &data);
     void connectionStateChanged(bool isConnected);
-    void clientConnected(const QString &clientIp);
-    void clientDisconnected();
+    void clientConnected(const QString &clientIp, quint64 sendSession);
+    void clientDisconnected(const QString &reason);
+    void tcpServerWaitChanged(const QString &reason);
     void errorOccurred(const QString &errorMsg);
     void connectionAttemptFinished(bool success, const QString &errorMsg);
     void localEndpointChanged(const QString &address, int port);
@@ -69,6 +71,7 @@ private slots:
     void onDisconnected();
     void onError(QAbstractSocket::SocketError socketError);
     void onNewConnection();
+    void refreshTcpServer(const QList<QHostAddress> &addresses);
     void onUdpReadyRead();
     void forwardTextReady(const QByteArray &text) { emit textReady(text); }
     void forwardChannelsUpdated(const QVector<double> &data);
@@ -77,8 +80,11 @@ private slots:
 private:
     StatusMonitoring::Session *m_statusMonitor = new StatusMonitoring::Session(this);
     RecordingChannelGuard m_recordingChannels;
-    void resetSendSession(bool ready, bool datagram = false);
+    quint64 resetSendSession(bool ready, bool datagram = false);
     void connectSendProgress(QTcpSocket *socket);
+    void checkTcpServerNetwork();
+    void dropTcpServerPeer(const QString &reason);
+    void publishTcpServerWait(const QString &reason);
     mutable QMutex m_sendMutex;
     qint64 m_pendingSendBytes = 0;
     int m_pendingSendRequests = 0;
@@ -101,8 +107,11 @@ private:
     WlrRecordingWriter m_wlrRecorder;
     bool m_useWlrRecording = false;
     std::atomic<qint64> loggedBytes{0};
-    QString m_serverIp;
-    int m_serverPort;
+    QTimer *m_tcpServerCheck;
+    QHostAddress m_tcpListenAddress;
+    quint16 m_tcpListenPort = 0;
+    bool m_tcpAcceptFailed = false;
+    QString m_tcpServerWaitReason;
     
     QByteArray m_buffer;
     QElapsedTimer m_receiveClock;

@@ -81,27 +81,27 @@ int main(int argc, char **argv)
     QJsonObject uart{{"schemaVersion", 3}, {"rxService", "FFF0"}, {"rxUuid", "FFF1"}, {"txService", "FFF0"},
                      {"txUuid", "FFF2"}, {"stream", true}, {"withoutResponse", false}};
     int rx = -1, tx = -1;
-    VERIFY(!BleChannelPolicy::quickConnect(gatt, uart, rx, tx) && rx == 0 && tx == 0);
+    VERIFY(!BleChannelPolicy::validatedChannels(gatt, uart, rx, tx) && rx == 0 && tx == 0);
     VERIFY(store.saveDeviceProfile(device, uart, error, gatt));
     auto validated = store.deviceProfile(device, error);
-    VERIFY(BleChannelPolicy::quickConnect(gatt, validated, rx, tx) && rx == 11 && tx == 14);
+    VERIFY(BleChannelPolicy::validatedChannels(gatt, validated, rx, tx) && rx == 11 && tx == 14);
     QJsonArray reordered;
     for (int i = gatt.size() - 1; i >= 0; --i) { auto c = gatt[i].toObject(); c["handle"] = c["handle"].toInt() + 100; reordered.append(c); }
-    VERIFY(BleChannelPolicy::quickConnect(reordered, validated, rx, tx) && rx == 111 && tx == 114);
+    VERIFY(BleChannelPolicy::validatedChannels(reordered, validated, rx, tx) && rx == 111 && tx == 114);
     auto changed = gatt; auto c = changed[3].toObject(); c["properties"] = 4; changed[3] = c;
-    VERIFY(!BleChannelPolicy::quickConnect(changed, validated, rx, tx));
+    VERIFY(!BleChannelPolicy::validatedChannels(changed, validated, rx, tx));
     auto duplicate = gatt; duplicate.append(gatt[2]);
     VERIFY(BleChannelPolicy::candidates(duplicate).isEmpty());
     auto ambiguous = validated; ambiguous["_validatedGatt"] = BleChannelPolicy::fingerprint(duplicate);
-    VERIFY(!BleChannelPolicy::quickConnect(duplicate, ambiguous, rx, tx));
+    VERIFY(!BleChannelPolicy::validatedChannels(duplicate, ambiguous, rx, tx));
     auto accelerated = validated; accelerated["packetSize"] = 244; accelerated["intervalMs"] = 0;
-    VERIFY(!BleChannelPolicy::quickConnect(gatt, accelerated, rx, tx));
+    VERIFY(BleChannelPolicy::validatedChannels(gatt, accelerated, rx, tx));
     auto unconfirmed = validated; unconfirmed["stream"] = false;
-    VERIFY(!BleChannelPolicy::quickConnect(gatt, unconfirmed, rx, tx));
+    VERIFY(!BleChannelPolicy::validatedChannels(gatt, unconfirmed, rx, tx));
     auto rxOnly = validated; rxOnly["txService"] = ""; rxOnly["txUuid"] = ""; rxOnly["stream"] = false;
-    VERIFY(BleChannelPolicy::quickConnect(gatt, rxOnly, rx, tx) && rx == 11 && tx == 0);
+    VERIFY(BleChannelPolicy::validatedChannels(gatt, rxOnly, rx, tx) && rx == 11 && tx == 0);
     auto dfu = validated; dfu["rxService"] = "FE59"; dfu["rxUuid"] = "8ec90001-f315-4f60-9fb8-838830daea50";
-    VERIFY(!BleChannelPolicy::quickConnect(gatt, dfu, rx, tx));
+    VERIFY(!BleChannelPolicy::validatedChannels(gatt, dfu, rx, tx));
     const auto portable = BleProfileStore::exportTemplate("UART", validated, error);
     VERIFY(!portable.contains("validatedGatt") && !portable.contains("ValidatedGatt"));
     VERIFY(store.saveDeviceProfile(device, uart, error)); // Editing next settings invalidates local evidence.

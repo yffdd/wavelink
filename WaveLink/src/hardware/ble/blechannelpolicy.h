@@ -1,6 +1,5 @@
 #pragma once
 #include "bleprofilestore.h"
-#include "blesendpolicy.h"
 #include <QCryptographicHash>
 #include <QStringList>
 
@@ -44,15 +43,14 @@ inline int resolve(const QJsonArray &entries, const QString &service, const QStr
     }
     return matches == 1 ? result : 0;
 }
-inline bool quickConnect(const QJsonArray &entries, const QJsonObject &saved, int &rx, int &tx)
+inline bool validatedChannels(const QJsonArray &entries, const QJsonObject &saved, int &rx, int &tx)
 {
     rx = tx = 0;
     QJsonObject p; QString error;
     if (!BleProfileStore::normalize(saved, p, error)) return false;
     const auto signature = fingerprint(entries);
     if (signature.isEmpty() || signature != saved.value("_validatedGatt").toString() ||
-        firmwareService(p.value("rxService").toString()) || firmwareService(p.value("txService").toString()) ||
-        BleSendPolicy::needsConfirmation(p.value("packetSize").toInt(), p.value("intervalMs").toInt())) return false;
+        firmwareService(p.value("rxService").toString()) || firmwareService(p.value("txService").toString())) return false;
     const bool hasRx = !p.value("rxUuid").toString().isEmpty(), hasTx = !p.value("txUuid").toString().isEmpty();
     const int r = resolve(entries, p.value("rxService").toString(), p.value("rxUuid").toString(), 16 | 32);
     const int t = resolve(entries, p.value("txService").toString(), p.value("txUuid").toString(), p.value("withoutResponse").toBool() ? 4 : 8);
@@ -60,16 +58,63 @@ inline bool quickConnect(const QJsonArray &entries, const QJsonObject &saved, in
     rx = r; tx = t; return rx || tx;
 }
 struct Candidate { QString name; int rx = 0, tx = 0; };
+inline Candidate nordicUart(const QJsonArray &entries)
+{
+    const auto profile = BleProfileStore::nus();
+    const auto service = profile.value("rxService").toString();
+    const int rx = resolve(entries, service, profile.value("rxUuid").toString(), 16);
+    const int tx = resolve(entries, service, profile.value("txUuid").toString(), 4 | 8);
+    if (!rx || !tx || rx == tx) return {};
+    int serviceHandle = 0;
+    for (const auto &v : entries) {
+        const auto c = v.toObject();
+        if (BleProfileStore::normalizeUuid(c.value("service").toString()) != service) continue;
+        const int handle = c.value("serviceHandle").toInt();
+        if (handle <= 0 || (serviceHandle && handle != serviceHandle)) return {};
+        serviceHandle = handle;
+    }
+    return {QStringLiteral("Nordic UART · 已识别收发通道"), rx, tx};
+}
+inline QJsonObject connectionProfile(const QJsonArray &entries, const QJsonObject &saved, int &rx, int &tx)
+{
+    if (validatedChannels(entries, saved, rx, tx)) {
+        QJsonObject profile;
+        QString error;
+        BleProfileStore::normalize(saved, profile, error);
+        return profile;
+    }
+    const auto known = nordicUart(entries);
+    if (!known.tx) return {};
+    const auto defaults = BleProfileStore::nus();
+    if (!saved.isEmpty()) {
+        for (const auto key : {"rxService", "rxUuid", "txService", "txUuid"})
+            if (saved.value(key) != defaults.value(key)) return {};
+    }
+    auto profile = saved.isEmpty() ? defaults : saved;
+    profile.remove("_validatedGatt");
+    profile["schemaVersion"] = 3;
+    profile["stream"] = true;
+    rx = known.rx;
+    tx = known.tx;
+    const bool preferWithoutResponse = profile.value("withoutResponse").toBool();
+    if (resolve(entries, profile.value("txService").toString(), profile.value("txUuid").toString(), preferWithoutResponse ? 4 : 8) != tx)
+        profile["withoutResponse"] = !preferWithoutResponse;
+    return profile;
+}
 inline QList<Candidate> candidates(const QJsonArray &entries)
 {
     QList<Candidate> result; QStringList services;
+    const auto nus = nordicUart(entries);
+    if (nus.tx) result.append(nus);
+    const auto nusService = BleProfileStore::nus().value("rxService").toString();
     for (const auto &v : entries) {
         const auto s = BleProfileStore::normalizeUuid(v.toObject().value("service").toString());
         if (!s.isEmpty() && !services.contains(s)) services << s;
     }
     for (const auto &s : services) {
         // Standard SIG services (battery, device info, HID, etc.) are not UART.
-        if (firmwareService(s) || (s.startsWith("000018") && s.endsWith("-0000-1000-8000-00805f9b34fb"))) continue;
+        if ((nus.tx && s == nusService) || firmwareService(s) ||
+            (s.startsWith("000018") && s.endsWith("-0000-1000-8000-00805f9b34fb"))) continue;
         QList<QJsonObject> receive, writeOnly, write;
         for (const auto &v : entries) {
             const auto c = v.toObject(); const int p = c.value("properties").toInt();
@@ -83,13 +128,9 @@ inline QList<Candidate> candidates(const QJsonArray &entries)
         int tx = 0;
         if (writers.size() == 1) tx = resolve(entries, s, writers.first().value("uuid").toString(), 4 | 8);
         if (!rx) continue;
-        const bool nus = s == "6e400001-b5a3-f393-e0a9-e50e24dcca9e" &&
-            BleProfileStore::normalizeUuid(receive.first().value("uuid").toString()) == "6e400003-b5a3-f393-e0a9-e50e24dcca9e" &&
-            tx && BleProfileStore::normalizeUuid(writers.first().value("uuid").toString()) == "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
         const QString shortService = s.endsWith("-0000-1000-8000-00805f9b34fb") ?
             s.mid(s.startsWith("0000") ? 4 : 0, s.startsWith("0000") ? 4 : 8).toUpper() : s;
-        result << Candidate{nus ? QStringLiteral("Nordic UART 结构匹配（仍需确认用途）") :
-            QStringLiteral("服务 %1（属性匹配候选，待确认用途）").arg(shortService), rx, tx};
+        result << Candidate{QStringLiteral("服务 %1（属性匹配候选，待确认用途）").arg(shortService), rx, tx};
     }
     return result;
 }

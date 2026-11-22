@@ -235,6 +235,7 @@ void MainWindow::stopRecordingSafely(const QString &errorMessage)
     isRecording = false;
     recordTimer->stop();
     btnToggleRecord->setText(QStringLiteral("开始录制"));
+    updateTcpServerPeerNotice();
     btnToggleRecord->setStyleSheet(QString());
     if (comboRecordingMode) comboRecordingMode->setEnabled(true);
     if (bleClient) updateBleControls();
@@ -540,6 +541,7 @@ void MainWindow::onToggleRecord()
 
             currentRecordStartTimeMs = QDateTime::currentMSecsSinceEpoch();
             recordTimer->start(1000);
+            updateTcpServerPeerNotice();
             if (bleClient) updateBleControls();
         } else {
             lblRecordStatus->setText("等待串口打开...");

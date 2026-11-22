@@ -50,6 +50,7 @@ signals:
     void dataReceived(const QByteArray &data);
     void notificationReceived(const QByteArray &data, qint64 receiveTimestampNs);
     void fileSendProgress(qint64 completedBytes, qint64 totalBytes);
+    void filePacketSubmitted(const QByteArray &data);
     void fileSendFinished(bool success, const QString &message);
     void fileSendStatus(const QString &message);
     void fileSendError(const QString &message);

@@ -100,13 +100,16 @@ void MainWindow::updateProtocolControls() {
     const bool custom = comboProtocol->currentData().toString() == "custom";
     const bool demo = comboInterface->currentData().toInt() == 3;
     const bool blocked = m_protocolInitialized && protocolChangeBlocked();
+    comboProtocol->setVisible(!demo);
+    btnDemoProtocolInfo->setVisible(demo);
     if (btnCustomProtocols) btnCustomProtocols->setVisible(custom);
-    comboEndianness->setVisible(comboProtocol->currentIndex() == 2);
-    comboCustomProfile->setVisible(custom); lblProtocolSummary->setVisible(custom || m_protocolApplyPending || m_configRecoveryPending);
+    comboEndianness->setVisible(!demo && comboProtocol->currentIndex() == 2);
+    comboCustomProfile->setVisible(!demo && custom);
+    lblProtocolSummary->setVisible((!demo && custom) || m_protocolApplyPending || m_configRecoveryPending);
     comboProtocol->setEnabled(!blocked && !demo); comboEndianness->setEnabled(!blocked && !demo); comboCustomProfile->setEnabled(!blocked && !demo);
     if (m_configRecoveryPending) lblProtocolSummary->setText("配置导入恢复未完成，请先处理恢复记录后重启，暂不应用协议。");
     else if (m_protocolApplyPending) lblProtocolSummary->setText("正在应用协议，请稍候…");
-    else if (custom && m_protocolStore) {
+    else if (!demo && custom && m_protocolStore) {
         QString text = "没有可用的自定义协议，请先在管理窗口新建或导入，再选择协议。";
         for (const auto &p : m_protocolStore->snapshot().profiles) if (p.id == comboCustomProfile->currentData().toString()) {
             const bool isText = p.definition.value("type") == QJsonValue("text");
@@ -115,7 +118,6 @@ void MainWindow::updateProtocolControls() {
                 .arg(protocolUiMatchesApplied() ? "已应用到当前接口" : m_protocolAutoApplyDeferred ? "等待自动应用；录制、发送或连接操作结束后继续" : "协议尚未生效，请重新选择或检查协议设置");
             break;
         }
-        if (comboInterface->currentData().toInt() == 3) text += "\nDemo 使用自身生成的数据，不按此协议解码。";
         lblProtocolSummary->setText(text);
     }
     // Other connection/recording update paths may adjust button states. These
@@ -246,6 +248,7 @@ void MainWindow::clearProtocolPlots() {
     onClearPlots(); resetFilters(); onMergeAllViews();
     for (auto graph : channelGraphs) if (!allPlots.isEmpty() && allPlots[0].plot) allPlots[0].plot->removeGraph(graph);
     channelGraphs.clear(); channelBuffers.clear(); channelToPlotMap.clear(); channelValueLabels.clear(); channelColorButtons.clear(); listChannels->clear();
+    updateChannelSelectionSummary();
     menuSpectrumChannels->clear(); if (comboMeasureChannel) comboMeasureChannel->clear();
     timeBuffer.clear(); sampleCount = 0; lastLatestTime = 0;
 }

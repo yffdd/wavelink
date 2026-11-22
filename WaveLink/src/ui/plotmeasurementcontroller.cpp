@@ -67,9 +67,9 @@ constexpr int MaximumSamples = 2000000;
 PlotMeasurementController::PlotMeasurementController(QCustomPlot *plot, QWidget *host, std::function<QString(int)> unitResolver, std::function<double()> timeResolver)
     : QObject(plot), m_plot(plot), m_unitResolver(std::move(unitResolver)), m_timeResolver(std::move(timeResolver)) {
     setObjectName("plotMeasurementController");
-    m_originalMinimumHeight = plot->minimumHeight();
     m_panel = new QWidget(host); m_panel->setObjectName("plotMeasurementPanel");
     m_panel->setMinimumWidth(0);
+    m_panel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     auto layout = new QVBoxLayout(m_panel); layout->setContentsMargins(4, 2, 4, 2); layout->setSpacing(2);
     auto header = new QHBoxLayout(); header->setSpacing(4); layout->addLayout(header);
     m_fold = new QToolButton(); m_fold->setObjectName("scopeFold"); m_fold->setText("测量");
@@ -168,8 +168,8 @@ bool PlotMeasurementController::hasAmplitudeCursors() const { return m_mode->cur
 
 void PlotMeasurementController::setEnabled(bool enabled) {
     if (m_enabled == enabled) return;
+    emit visibilityAboutToChange(enabled);
     m_enabled = enabled; m_panel->setVisible(enabled); m_drag = -1;
-    m_plot->setMinimumHeight(enabled ? qMax(160, m_originalMinimumHeight) : m_originalMinimumHeight);
     if (QWidget::mouseGrabber() == m_plot) m_plot->releaseMouse();
     if (enabled) { emit activated(); m_timer.start(); syncChannels(); initializeCursors(); }
     else { m_timer.stop(); ++m_version; m_stampValid = false; }
@@ -214,16 +214,7 @@ void PlotMeasurementController::syncChannels() {
 }
 double PlotMeasurementController::snapTime(double time) const {
     if (!m_snap->isChecked() || !m_source || m_source->dataCount() == 0) return time;
-    if (m_source->hasOfflineSource()) {
-        QVector<QCPGraphData> points; QString error;
-        if (!m_source->nearbySamples(time, points, error)) return time;
-        return std::min_element(points.cbegin(), points.cend(), [time](const QCPGraphData &a, const QCPGraphData &b) { return std::abs(a.key - time) < std::abs(b.key - time); })->key;
-    }
-    const auto data = m_source->data(); auto next = data->findBegin(time, false);
-    if (next == data->constEnd()) return (data->constEnd() - 1)->key;
-    if (next == data->constBegin()) return next->key;
-    const auto previous = next - 1;
-    return std::abs(previous->key - time) <= std::abs(next->key - time) ? previous->key : next->key;
+    return m_source->nearestSampleTime(time);
 }
 double PlotMeasurementController::valueAt(double time) const {
     if (!m_source || m_source->dataCount() == 0) return ScopeMeasurements::unavailable();
@@ -397,7 +388,7 @@ void PlotMeasurementController::populateProjects(QMenu *menu) {
     }
     menu->setToolTipsVisible(true);
 }
-void PlotMeasurementController::appendMenu(QMenu *menu) {
+QMenu *PlotMeasurementController::appendMenu(QMenu *menu) {
     syncChannels();
     QMenu *measure = menu->objectName() == "scopeSettingsMenu" ? menu : menu->addMenu("测量");
     measure->setObjectName("scopeMeasurementMenu");
@@ -431,6 +422,7 @@ void PlotMeasurementController::appendMenu(QMenu *menu) {
     connect(measure->addAction("自动测量阈值设置…"), &QAction::triggered, this, &PlotMeasurementController::editThresholds);
     connect(measure->addAction("重置光标至可见范围"), &QAction::triggered, this, [this] { setEnabled(true); resetCursors(); });
     connect(measure->addAction("清除测量"), &QAction::triggered, this, [this] { setEnabled(false); resetData(); });
+    return measure;
 }
 void PlotMeasurementController::editPositions() {
     initializeCursors();
@@ -496,10 +488,12 @@ void PlotMeasurementController::editThresholds() {
     dialog.resize(510, 440); dialog.exec();
 }
 
-void PlotMeasurementController::setPreferenceKey(const QString &key) {
+void PlotMeasurementController::setPreferenceKey(const QString &key, bool rememberVisibility) {
     m_preferenceKey = key; if (key.isEmpty()) return;
+    m_rememberVisibility = rememberVisibility;
     m_loading = true; QSettings settings("WaveLink", "WaveLink"); settings.beginGroup(key);
-    const bool enabled = settings.value("Enabled", false).toBool();
+    const bool enabled = m_rememberVisibility ? settings.value("Enabled", false).toBool() : m_enabled;
+    if (!m_rememberVisibility) settings.remove("Enabled"); // Remove legacy auto-open state for detached views.
     m_selectedChannel = qBound(-1, settings.value("Channel", -1).toInt(), 255);
     m_mode->setCurrentIndex(qBound(0, settings.value("CursorMode", TimeCursors).toInt(), 3));
     m_range->setCurrentIndex(qBound(0, settings.value("Range", 0).toInt(), 1));
@@ -524,7 +518,8 @@ void PlotMeasurementController::setPreferenceKey(const QString &key) {
 void PlotMeasurementController::savePreferences() {
     if (m_loading || m_preferenceKey.isEmpty()) return;
     QSettings settings("WaveLink", "WaveLink"); settings.beginGroup(m_preferenceKey);
-    settings.setValue("Enabled", m_enabled); settings.setValue("Channel", m_selectedChannel);
+    if (m_rememberVisibility) settings.setValue("Enabled", m_enabled);
+    settings.setValue("Channel", m_selectedChannel);
     settings.setValue("CursorMode", m_mode->currentIndex()); settings.setValue("Range", m_range->currentIndex());
     settings.setValue("Snap", m_snap->isChecked()); settings.setValue("Expanded", m_fold->isChecked());
     QStringList projects = m_projects.values(); std::sort(projects.begin(), projects.end()); settings.setValue("Projects", projects);

@@ -111,13 +111,17 @@ static bool verifyTheme(bool dark, const QString &outputDir)
     auto v011Text = dialog.findChild<QTextBrowser *>("changelogV011Text");
     auto v012Text = dialog.findChild<QTextBrowser *>("changelogV012Text");
     auto v013Text = dialog.findChild<QTextBrowser *>("changelogV013Text");
-    if (!currentRelease || !currentText || !previousText || !v010Text || !v011Text || !v012Text || !v013Text ||
+    auto v014Text = dialog.findChild<QTextBrowser *>("changelogV014Text");
+    if (!currentRelease || !currentText || !previousText || !v010Text || !v011Text || !v012Text || !v013Text || !v014Text ||
         !currentRelease->text().contains("V" + QCoreApplication::applicationVersion()) ||
         !currentRelease->text().contains(QStringLiteral("当前版本")) ||
         !currentText->isVisible() || !previousText->isHidden() ||
-        !currentText->toPlainText().contains(QStringLiteral("视图测量")) ||
-        !currentText->toPlainText().contains(QStringLiteral("按需加载")) ||
-        !currentText->toPlainText().contains(QStringLiteral("背景颜色")) ||
+        !currentText->toPlainText().contains(QStringLiteral("所有通道均未勾选")) ||
+        !currentText->toPlainText().contains(QStringLiteral("ANSI 前景色和背景色")) ||
+        !currentText->toPlainText().contains(QStringLiteral("Demo 协议说明")) ||
+        !v014Text->isHidden() || !v014Text->toPlainText().contains(QStringLiteral("视图测量")) ||
+        !v014Text->toPlainText().contains(QStringLiteral("按需加载")) ||
+        !v014Text->toPlainText().contains(QStringLiteral("背景颜色")) ||
         !v013Text->isHidden() || !v013Text->toPlainText().contains(QStringLiteral("状态监视面板")) ||
         !v013Text->toPlainText().contains(QStringLiteral("接收文本监视")) ||
         !v013Text->toPlainText().contains(QStringLiteral("全局配置集成")) ||
@@ -146,7 +150,7 @@ static bool verifyTheme(bool dark, const QString &outputDir)
     if (!changelogScroll) return false;
     const auto releases = changelogScroll->findChildren<QToolButton *>();
     const auto releaseBodies = changelogScroll->findChildren<QTextBrowser *>();
-    if (releases.size() != 14 || releaseBodies.size() != 14) return false;
+    if (releases.size() != 15 || releaseBodies.size() != 15) return false;
     for (auto release : releases) if (release != currentRelease) release->click();
     for (const auto &size : {QSize(720, 480), QSize(1080, 760), QSize(840, 560)}) {
         dialog.resize(size); settleGuide();

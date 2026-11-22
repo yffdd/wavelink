@@ -226,7 +226,8 @@ bool BleHostClient::consumeSendSettings(const QJsonObject &obj, bool applied)
 }
 bool BleHostClient::readCharacteristic(int handle)
 {
-    if (m_state != State::AwaitingConfiguration || readPending()) return false;
+    if (handle <= 0 || readPending() ||
+        (m_state != State::AwaitingConfiguration && (m_state != State::Ready || sendBusy()))) return false;
     auto obj = makeCommand(QStringLiteral("read")); obj.insert("handle", handle);
     m_readRequest = obj.value("request").toString(); m_deadline.start(10000);
     return command(obj);
@@ -239,7 +240,7 @@ bool BleHostClient::sendData(const QByteArray &data)
 }
 bool BleHostClient::startFileSend(const QString &path, QString &error)
 {
-    if (m_state != State::Ready || !canSend() || fileSendBusy() || !m_sendQueue.isEmpty() || !m_packet.isEmpty()) {
+    if (m_state != State::Ready || !canSend() || readPending() || fileSendBusy() || !m_sendQueue.isEmpty() || !m_packet.isEmpty()) {
         error = QStringLiteral("连接尚未就绪、没有发送特征或仍有发送数据未完成，请稍后再试。"); return false;
     }
     if (!m_fileReaderSupported) { error = QStringLiteral("BLE 辅助程序不支持安全后台文件读取，请更新完整软件包。"); return false; }
@@ -301,12 +302,14 @@ void BleHostClient::deliverNotification(const QByteArray &data, qint64 timestamp
 }
 void BleHostClient::pumpWrites()
 {
-    if (m_state != State::Ready || !canSend() || !m_packet.isEmpty() || m_sendQueue.isEmpty() || m_writeDelay.isActive()) return;
+    if (m_state != State::Ready || !canSend() || readPending() || !m_packet.isEmpty() || m_sendQueue.isEmpty() || m_writeDelay.isActive()) return;
     m_packet = m_sendQueue.left(m_effectivePacket); m_sendQueue.remove(0, m_packet.size());
     auto obj = makeCommand(QStringLiteral("write")); obj.insert("data", QString::fromLatin1(m_packet.toBase64()));
-    m_writeRequest = obj.value("request").toString(); m_deadline.start(10000); command(obj);
+    m_writeRequest = obj.value("request").toString(); m_deadline.start(10000);
+    const bool submitted = command(obj);
     if (m_fileActive && !m_packet.isEmpty()) {
         m_fileWriteRequest = m_writeRequest;
+        if (submitted) emit filePacketSubmitted(m_packet);
         if (m_fileEof && m_sendQueue.isEmpty()) emit fileSendStatus(QStringLiteral("等待最后一包确认…"));
     }
 }
@@ -355,7 +358,7 @@ void BleHostClient::consume(const QJsonObject &obj)
         else if (request == m_settingsRequest && !m_settingsRequest.isEmpty()) {
             m_lastError = text; m_settingsRequest.clear(); m_deadline.stop(); emit errorOccurred(text, false); emit sendSettingsChanged(); emit operationFinished();
         } else if (request == m_readRequest && readPending()) {
-            m_lastError = text; m_readRequest.clear(); m_deadline.stop(); emit errorOccurred(text, false); emit operationFinished();
+            m_lastError = text; m_readRequest.clear(); m_deadline.stop(); emit errorOccurred(text, false); pumpWrites(); emit operationFinished();
         } // Unrelated informational errors must not cancel an outstanding write deadline.
     } else if (type == "device" && m_state == State::Scanning && request == m_scanRequest) {
         emit deviceFound(obj);
@@ -411,6 +414,7 @@ void BleHostClient::consume(const QJsonObject &obj)
     } else if (type == "read" && request == m_readRequest && readPending()) {
         m_deadline.stop(); m_readRequest.clear();
         emit characteristicRead(obj.value("handle").toInt(), QByteArray::fromBase64(obj.value("data").toString().toLatin1()));
+        pumpWrites();
         emit operationFinished();
     }
 }

@@ -1,3 +1,7 @@
+#ifdef _WIN32
+#include <winsock2.h>
+#include <mstcpip.h>
+#endif
 #include "networkhandler.h"
 #include "ProtocolParserFactory.h"
 #include <QFile>
@@ -5,17 +9,46 @@
 #include <QDateTime>
 #include <QRegularExpression>
 #include <QNetworkProxy>
-#include <QTimer>
+#include <QNetworkInterface>
+
+namespace {
+bool isWildcard(const QHostAddress &address)
+{
+    return address == QHostAddress::AnyIPv4 || address == QHostAddress::AnyIPv6
+        || address == QHostAddress::Any;
+}
+
+bool localAddressAvailable(const QHostAddress &address, const QList<QHostAddress> &addresses)
+{
+    // Some adapters do not expose loopback through the interface list.
+    if (address.isLoopback() || isWildcard(address)) return true;
+    for (const auto &local : addresses) {
+        if (!address.isEqual(local, QHostAddress::ConvertV4MappedToIPv4)) continue;
+        if (address.scopeId().isEmpty() || address.scopeId() == local.scopeId()) return true;
+        const auto scopeIndex = [](const QString &scope) {
+            bool numeric;
+            const int index = scope.toInt(&numeric);
+            return numeric ? index : QNetworkInterface::interfaceIndexFromName(scope);
+        };
+        const int index = scopeIndex(address.scopeId());
+        if (index > 0 && index == scopeIndex(local.scopeId())) return true;
+    }
+    return false;
+}
+}
 
 NetworkHandler::NetworkHandler(QObject *parent)
     : QObject(parent), m_tcpSocket(nullptr), m_tcpServer(new QTcpServer(this)), m_mode(1), m_parser(nullptr),
-      loggedBytes(0)
+      loggedBytes(0), m_tcpServerCheck(new QTimer(this))
 {
     m_wlrRecorder.setErrorHandler([this](const QString &error) { emit recordingError(error); });
     m_receiveEpochNs = QDateTime::currentMSecsSinceEpoch() * 1000000LL;
     m_receiveClock.start();
     m_tcpServer->setProxy(QNetworkProxy::NoProxy);
     connect(m_tcpServer, &QTcpServer::newConnection, this, &NetworkHandler::onNewConnection);
+    connect(m_tcpServer, &QTcpServer::acceptError, this, [this] { m_tcpAcceptFailed = true; });
+    m_tcpServerCheck->setInterval(1000);
+    connect(m_tcpServerCheck, &QTimer::timeout, this, &NetworkHandler::checkTcpServerNetwork);
 }
 
 NetworkHandler::~NetworkHandler()
@@ -122,6 +155,9 @@ bool NetworkHandler::startConnection(int mode, const QString &ip, int port, cons
         if (!m_tcpServer->listen(listenAddress, quint16(port)))
             return failed(QStringLiteral("无法监听 %1:%2：%3。请确认 IP 属于当前电脑、端口未被占用。")
                 .arg(addressText).arg(port).arg(m_tcpServer->errorString()));
+        m_tcpListenAddress = listenAddress;
+        m_tcpListenPort = m_tcpServer->serverPort();
+        m_tcpServerCheck->start();
         emit connectionStateChanged(true); // Treat listening as "connected" for UI purposes
         emit connectionAttemptFinished(true, QString());
         return true;
@@ -195,15 +231,19 @@ void NetworkHandler::stopConnection()
         m_tcpSocket->deleteLater();
         m_tcpSocket = nullptr;
     } else if (m_mode == 2) {
-        if (m_tcpServer->isListening()) {
-            m_tcpServer->close();
-        }
+        m_tcpServerCheck->stop();
+        m_tcpListenPort = 0;
+        m_tcpListenAddress.clear();
+        m_tcpAcceptFailed = false;
+        m_tcpServerWaitReason.clear();
+        m_tcpServer->close();
         if (m_tcpSocket) {
             QObject::disconnect(m_tcpSocket, nullptr, this, nullptr);
-            m_tcpSocket->disconnectFromHost();
+            m_tcpSocket->abort();
             m_tcpSocket->deleteLater();
             m_tcpSocket = nullptr;
         }
+        stopRecording();
         emit connectionStateChanged(false);
     }
 }
@@ -219,6 +259,69 @@ bool NetworkHandler::isConnected() const
     return false;
 }
 
+void NetworkHandler::checkTcpServerNetwork()
+{
+    if (!m_tcpListenPort) return;
+    QList<QHostAddress> addresses;
+    for (const auto &iface : QNetworkInterface::allInterfaces()) {
+        const auto flags = iface.flags();
+        if (!flags.testFlag(QNetworkInterface::IsUp) || !flags.testFlag(QNetworkInterface::IsRunning)) continue;
+        for (const auto &entry : iface.addressEntries()) addresses.append(entry.ip());
+    }
+    refreshTcpServer(addresses);
+}
+
+void NetworkHandler::refreshTcpServer(const QList<QHostAddress> &addresses)
+{
+    if (!m_tcpListenPort) return;
+
+    const bool canBind = localAddressAvailable(m_tcpListenAddress, addresses);
+    if (!canBind || m_tcpAcceptFailed) m_tcpServer->close();
+    m_tcpAcceptFailed = false;
+    if (m_tcpSocket && !localAddressAvailable(m_tcpSocket->localAddress(), addresses)) {
+        dropTcpServerPeer(QStringLiteral("客户端所在的本机网络已断开。"));
+    }
+
+    if (!canBind) {
+        publishTcpServerWait(QStringLiteral("等待监听 IP %1 恢复。IP 已变时请关闭服务器并重新设置。")
+            .arg(m_tcpListenAddress.toString()));
+        return;
+    }
+    if (!m_tcpServer->isListening() && !m_tcpServer->listen(m_tcpListenAddress, m_tcpListenPort)) {
+        publishTcpServerWait(QStringLiteral("正在尝试恢复监听 %1:%2。%3")
+            .arg(m_tcpListenAddress.toString()).arg(m_tcpListenPort).arg(m_tcpServer->errorString()));
+        return;
+    }
+    publishTcpServerWait({});
+}
+
+void NetworkHandler::publishTcpServerWait(const QString &reason)
+{
+    if (reason == m_tcpServerWaitReason) return;
+    m_tcpServerWaitReason = reason;
+    emit tcpServerWaitChanged(reason);
+}
+
+void NetworkHandler::dropTcpServerPeer(const QString &reason)
+{
+    if (!m_tcpSocket) return;
+    auto socket = m_tcpSocket;
+    m_tcpSocket = nullptr;
+    QObject::disconnect(socket, nullptr, this, nullptr);
+    // This can run from readyRead/error, while Qt is still handling an
+    // underlying socket notification. Retire immediately, close after it returns.
+    QTimer::singleShot(0, socket, [socket] {
+        socket->abort();
+        socket->deleteLater();
+    });
+    resetSendSession(false);
+    m_buffer.clear();
+    if (m_parser) m_parser->reset();
+    m_statusMonitor->setConnected(false);
+    // The recording stays open across peers; its channel guard still checks every frame.
+    emit clientDisconnected(reason);
+}
+
 void NetworkHandler::onNewConnection()
 {
     // A recording belongs to one peer. Never let another device silently
@@ -232,17 +335,22 @@ void NetworkHandler::onNewConnection()
         return;
     }
     if (m_tcpSocket) {
-        // Disconnect old client before replacing it.
-        QObject::disconnect(m_tcpSocket, nullptr, this, nullptr);
-        m_tcpSocket->disconnectFromHost();
-        m_tcpSocket->deleteLater();
+        dropTcpServerPeer({});
     }
     m_buffer.clear();
     if (m_parser) m_parser->reset();
     m_tcpSocket = m_tcpServer->nextPendingConnection();
     if (!m_tcpSocket) return;
+#ifdef _WIN32
+    // Windows' default keepalive delay is too long for a vanished device.
+    tcp_keepalive keepalive{1, 10000, 2000};
+    DWORD bytesReturned = 0;
+    if (WSAIoctl(static_cast<SOCKET>(m_tcpSocket->socketDescriptor()), SIO_KEEPALIVE_VALS,
+                 &keepalive, sizeof(keepalive), nullptr, 0, &bytesReturned, nullptr, nullptr) != 0)
+#endif
+        m_tcpSocket->setSocketOption(QAbstractSocket::KeepAliveOption, 1);
     m_statusMonitor->setConnected(true);
-    resetSendSession(true);
+    const auto sendSession = resetSendSession(true);
     connectSendProgress(m_tcpSocket);
     connect(m_tcpSocket, &QTcpSocket::readyRead, this, &NetworkHandler::onReadyRead);
     connect(m_tcpSocket, &QTcpSocket::disconnected, this, &NetworkHandler::onDisconnected);
@@ -252,8 +360,7 @@ void NetworkHandler::onNewConnection()
     connect(m_tcpSocket, QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::error), this, &NetworkHandler::onError);
 #endif
     
-    emit clientConnected(m_tcpSocket->peerAddress().toString());
-    // Optionally emit a signal that a client connected
+    emit clientConnected(m_tcpSocket->peerAddress().toString(), sendSession);
 }
 
 void NetworkHandler::onReadyRead()
@@ -266,19 +373,20 @@ void NetworkHandler::onReadyRead()
         m_statusMonitor->feedReceived(data,m_currentReceiveTimestampNs);
         m_rxCount.fetch_add(data.size());
         emit dataReceived(data); // Pass raw data for UI logging
+        if (!m_parser) return;
         
         // OS reads may contain megabytes of VALID frames. Parse bounded
         // chunks before testing the unconsumed backlog, never discard a valid
         // burst simply because TCP coalesced it into one read.
         for (int offset = 0; offset < data.size(); offset += 64 * 1024) {
             m_buffer.append(data.constData() + offset, qMin(64 * 1024, data.size() - offset));
-            if (m_parser) {
-                const int consumed = m_parser->processData(m_buffer.constData(), m_buffer.size());
-                if (consumed > 0 && consumed <= m_buffer.size()) m_buffer.remove(0, consumed);
-            }
+            const int consumed = m_parser->processData(m_buffer.constData(), m_buffer.size());
+            if (consumed > 0 && consumed <= m_buffer.size()) m_buffer.remove(0, consumed);
             if (m_buffer.size() > 1024 * 1024) {
                 m_buffer.clear();
-                emit errorOccurred(QStringLiteral("未能解析的网络数据超过 1 MB，已停止采集。请检查数据协议。"));
+                const auto reason = QStringLiteral("未能解析的数据超过 1 MB，请检查数据协议。");
+                if (m_mode == 2) dropTcpServerPeer(reason);
+                else emit errorOccurred(reason);
                 return;
             }
         }
@@ -335,10 +443,11 @@ void NetworkHandler::sendData(const QByteArray &data)
     enqueueData(data);
 }
 
-void NetworkHandler::resetSendSession(bool ready, bool datagram)
+quint64 NetworkHandler::resetSendSession(bool ready, bool datagram)
 {
     QMutexLocker lock(&m_sendMutex);
     ++m_sendGeneration; m_pendingSendBytes = 0; m_pendingSendRequests = 0; m_sendReady = ready; m_datagramSend = datagram;
+    return m_sendGeneration;
 }
 
 void NetworkHandler::connectSendProgress(QTcpSocket *socket)
@@ -350,12 +459,13 @@ void NetworkHandler::connectSendProgress(QTcpSocket *socket)
     });
 }
 
-bool NetworkHandler::enqueueData(const QByteArray &data)
+bool NetworkHandler::enqueueData(const QByteArray &data, quint64 expectedSession)
 {
     if (data.isEmpty()) return false;
     quint64 generation;
     {
         QMutexLocker lock(&m_sendMutex);
+        if (expectedSession && expectedSession != m_sendGeneration) return false;
         if (!m_sendReady || data.size() > 256 * 1024 - m_pendingSendBytes || m_pendingSendRequests >= 1024) return false;
         if (m_datagramSend && data.size() > 65507) return false; // Never silently split a UDP command.
         generation = m_sendGeneration; m_pendingSendBytes += data.size(); ++m_pendingSendRequests;
@@ -376,11 +486,17 @@ bool NetworkHandler::enqueueData(const QByteArray &data)
             return;
         }
         if (!m_tcpSocket || m_tcpSocket->state() != QAbstractSocket::ConnectedState) {
+            if (m_mode == 2) {
+                dropTcpServerPeer(QStringLiteral("客户端连接已关闭。"));
+                return;
+            }
             resetSendSession(false); emit errorOccurred("网络发送已停止：客户端已经断开，未完成数据不会自动重发。"); return;
         }
-        if (m_tcpSocket->write(data) != data.size()) {
-            const QString detail = m_tcpSocket->errorString(); resetSendSession(false);
-            emit errorOccurred("网络写入失败，发送已停止：" + detail);
+        auto socket = m_tcpSocket;
+        if (socket->write(data) != data.size() && socket == m_tcpSocket) {
+            const QString detail = QStringLiteral("网络写入失败：") + socket->errorString();
+            if (m_mode == 2) dropTcpServerPeer(detail);
+            else { resetSendSession(false); emit errorOccurred(detail); }
         }
     }, Qt::QueuedConnection);
     if (!submitted) {
@@ -401,24 +517,25 @@ void NetworkHandler::onConnected()
 void NetworkHandler::onDisconnected()
 {
     QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender());
-    if (socket && socket != m_tcpSocket) return;
+    if (!socket || socket != m_tcpSocket) return;
+    if (m_mode == 2) {
+        dropTcpServerPeer({});
+        return;
+    }
     m_statusMonitor->setConnected(false);
     resetSendSession(false);
-    if (m_mode == 1) {
-        emit connectionStateChanged(false);
-    } else {
-        emit clientDisconnected();
-    }
+    emit connectionStateChanged(false);
 }
 
 void NetworkHandler::onError(QAbstractSocket::SocketError socketError)
 {
-    Q_UNUSED(socketError);
-    if (sender() != m_tcpSocket) return; // Ignore a retired socket's late error.
-    if (m_mode == 2 && socketError == QAbstractSocket::RemoteHostClosedError) return;
-    if (m_tcpSocket) {
-        emit errorOccurred(m_tcpSocket->errorString());
+    if (!m_tcpSocket || sender() != m_tcpSocket) return;
+    if (m_mode == 2) {
+        if (socketError != QAbstractSocket::RemoteHostClosedError)
+            dropTcpServerPeer(QStringLiteral("客户端网络异常：") + m_tcpSocket->errorString());
+        return;
     }
+    emit errorOccurred(m_tcpSocket->errorString());
 }
 
 void NetworkHandler::forwardChannelsUpdated(const QVector<double> &data)

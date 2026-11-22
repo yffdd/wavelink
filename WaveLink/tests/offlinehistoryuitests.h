@@ -52,13 +52,15 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
     QElapsedTimer ready; ready.start(); VERIFY(until([&] { return ready.elapsed() > 180; }));
     for (auto timer : window.findChildren<QTimer *>())
         if (timer->objectName() == "serialHardwareCheckTimer" || timer->objectName() == "waveformRefreshTimer") timer->stop();
-    QCheckBox *lowpass = nullptr;
+    QCheckBox *lowpass = nullptr, *selectAll = nullptr;
     for (auto check : window.findChildren<QCheckBox *>()) {
         if (check->text().startsWith("低通")) lowpass = check;
+        if (check->text().startsWith("全选/")) selectAll = check;
         if (check->text().startsWith("陷波") || check->text().startsWith("高通") || check->text().startsWith("低通")) check->setChecked(false);
     }
-    auto dock = window.findChild<QDockWidget *>(QStringLiteral("PlotDock_主视图")); VERIFY(dock && lowpass);
+    auto dock = window.findChild<QDockWidget *>(QStringLiteral("PlotDock_主视图")); VERIFY(dock && lowpass && selectAll);
     auto main = dock->findChild<QCustomPlot *>(); VERIFY(main);
+    auto noChannels = main->findChild<QCPItemText *>("noChannelsSelectedText"); VERIFY(noChannels && !noChannels->visible());
     const auto spansVisible = [](QCustomPlot *plot) {
         bool xVisible = false, yVisible = false;
         for (int i = 0; i < plot->itemCount(); ++i) {
@@ -98,9 +100,16 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
             std::abs((graph->data()->constEnd() - 1)->key - lastTime) < 1e-7;
     };
     for (const auto &path : {csvPath, wlrPath}) {
+        if (path == csvPath) {
+            advanced.setValue("ChannelVisible_0", false);
+            advanced.setValue("ChannelVisible_1", false);
+        }
         messages.lastTitle.clear(); const bool imported = offlineHistoryFileAction(window, path, true);
         if (!imported || messages.lastTitle != "导入成功") std::cerr << "Offline import picked=" << imported << " title=" << messages.lastTitle.toStdString() << " text=" << messages.lastText.toStdString() << '\n';
         VERIFY(imported && messages.lastTitle == "导入成功");
+        VERIFY(noChannels->visible() == (path == csvPath));
+        selectAll->setChecked(true);
+        VERIFY(!noChannels->visible());
         VERIFY(spansVisible(main));
         if (paged) {
             VERIFY(messages.lastText.contains("设置 → 系统设置 → 绘图显示 → 离线完整加载上限"));
@@ -143,6 +152,10 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
         VERIFY(channels && detachPlotTestChannel(window, channels, 0));
         auto separateDock = window.findChild<QDockWidget *>("PlotDock_独立视图: " + names[0]); VERIFY(separateDock);
         auto separate = separateDock->findChild<QCustomPlot *>(); VERIFY(separate && complete(separate->graph(0)));
+        selectAll->setChecked(false);
+        VERIFY(noChannels->visible() && separate->graph(0)->visible() && !separate->findChild<QCPItemText *>("noChannelsSelectedText"));
+        selectAll->setChecked(true);
+        VERIFY(!noChannels->visible());
         VERIFY(spansVisible(separate));
         VERIFY(choosePlotChannelAction(separate, "添加通道显示", names[1]));
         VERIFY(separate->graphCount() == 2 && complete(separate->graph(0)) && complete(separate->graph(1)));
@@ -178,6 +191,15 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
         for (auto plot : {main, separate}) for (int ch = 0; ch < plot->graphCount(); ++ch) VERIFY(complete(plot->graph(ch)));
         std::cout << "Complete " << QFileInfo(path).suffix().toStdString() << " survives limit changes, measurement, filtering, panning and detached views.\n";
         if (path == csvPath) {
+            auto globalReadout = window.findChild<QLabel *>("globalTimeReadout");
+            auto globalBar = window.findChild<QWidget *>("globalTimeMeasurementBar");
+            auto locateInterval = window.findChild<QToolButton *>("globalTimeLocate");
+            VERIFY(globalReadout && globalBar && locateInterval && toggleGlobalTime(separate));
+            VERIFY(editGlobalTime(window, 1.1124, 1.3876, 0));
+            const QString intervalReadout = globalReadout->text();
+            VERIFY(intervalReadout.contains("1.112 s") && intervalReadout.contains("1.388 s") && intervalReadout.contains("276 ms"));
+            locateInterval->click();
+            VERIFY(main->xAxis->range().contains(1.112) && main->xAxis->range().contains(1.388));
             slider->setValues(1, 1.5);
             QElapsedTimer playbackTime; playbackTime.start();
             playback->click();
@@ -187,6 +209,12 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
             VERIFY(std::abs(slider->upperValue() - slider->lowerValue() - .5) < 1e-9);
             VERIFY(main->xAxis->range() == separate->xAxis->range() &&
                    main->xAxis->range().lower == slider->lowerValue());
+            VERIFY(globalReadout->text() == intervalReadout);
+            for (auto plot : {main, separate}) {
+                auto a = plot->findChild<QCPItemLine *>("globalTimeCursorA");
+                auto b = plot->findChild<QCPItemLine *>("globalTimeCursorB");
+                VERIFY(a && b && scopeNear(a->start->key(), 1.112, 1e-9) && scopeNear(b->start->key(), 1.388, 1e-9));
+            }
             if (paged) {
                 const auto samples = main->graph(0)->data();
                 VERIFY(!samples->isEmpty() && samples->constBegin()->key >= slider->lowerValue() &&
@@ -212,6 +240,7 @@ static int offlineHistoryUiTests(OffscreenMessages &messages, bool paged = false
             auto ports = window.findChild<QComboBox *>("comboPorts");
             ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY");
             open->click(); VERIFY(until([&] { return open->text().contains("关闭"); }));
+            VERIFY(globalBar->isHidden());
             VERIFY(spansVisible(main) && spansVisible(separate));
             VERIFY(!playback->isEnabled() && playback->icon().cacheKey() == playIcon);
             for (auto plot : {main, separate}) for (int ch = 0; ch < plot->graphCount(); ++ch) {

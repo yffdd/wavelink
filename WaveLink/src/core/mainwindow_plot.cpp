@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include <QApplication>
 #include <QTime>
 #include <QProcess>
 #include <QDir>
@@ -27,6 +28,7 @@
 #include "plotscrollarea.h"
 #include "waveformgraph.h"
 #include "plotmeasurementcontroller.h"
+#include "globaltimemeasurement.h"
 #include <QListWidget>
 #include <QLineEdit>
 #ifdef Q_OS_WIN
@@ -49,6 +51,7 @@
 #include <QScreen>
 #include <QGuiApplication>
 #include <QKeyEvent>
+#include <QResizeEvent>
 #include <QPlainTextEdit>
 #include <QAbstractSpinBox>
 #include <QSignalBlocker>
@@ -60,6 +63,18 @@
 #include <algorithm>
 
 namespace {
+constexpr int SuggestedDetachedWaveformHeight = 240;
+constexpr int MinimumWaveformHeight = 160;
+constexpr int MaximumDetachedWaveformHeight = 1200;
+
+int plotDockChromeHeight(const QDockWidget *dock)
+{
+    // An existing dock's content starts below its title bar. Size hints can
+    // still include the old panel height during a show/hide transition.
+    if (dock->isVisible() && dock->widget()->y() > 0) return dock->widget()->y();
+    return qMax(0, dock->sizeHint().height() - dock->widget()->sizeHint().height());
+}
+
 // Use QCP's own padded text bounds, in logical pixels, after axis layout.
 // The caller supplies the tracer anchor again on every render so clamping
 // never changes the measured data point or accumulates after zoom/resize.
@@ -226,6 +241,22 @@ MainWindow::PlotContext MainWindow::createNewPlotContext(const QString &title, b
     ctx.heightText->setText(QString("Y跨度: %1").arg(ctx.plot->yAxis->range().size(), 0, 'f', spinDecimals ? spinDecimals->value() : 2));
     ctx.heightText->setColor(QColor(200, 200, 200, 150));
     ctx.heightText->setFont(QFont("Arial", 9));
+    if (isMain) {
+        auto hint = new QCPItemText(ctx.plot);
+        ctx.noChannelsSelectedText = hint;
+        hint->setObjectName("noChannelsSelectedText");
+        hint->setText(QStringLiteral("未勾选数据通道\n请在「数据通道」中勾选要显示的通道"));
+        hint->setPositionAlignment(Qt::AlignCenter);
+        hint->setTextAlignment(Qt::AlignCenter);
+        hint->position->setType(QCPItemPosition::ptAxisRectRatio);
+        hint->position->setCoords(0.5, 0.5);
+        QFont hintFont = ctx.plot->font();
+        hintFont.setPointSize(11);
+        hint->setFont(hintFont);
+        hint->setPadding(QMargins(12, 8, 12, 8));
+        hint->setSelectable(false);
+        hint->setVisible(false);
+    }
     ctx.tracer1->setStyle(QCPItemTracer::tsCircle);
     ctx.tracer1->setPen(QPen(Qt::red, 2));
     ctx.tracer1->setBrush(QBrush(QColor(255, 0, 0, 100)));
@@ -329,6 +360,7 @@ MainWindow::PlotContext MainWindow::createNewPlotContext(const QString &title, b
     ctx.dock->setObjectName(QString("PlotDock_%1").arg(title));
     auto frame = new QWidget(); auto frameLayout = new QVBoxLayout(frame);
     frameLayout->setContentsMargins(0, 0, 0, 0); frameLayout->setSpacing(0); frameLayout->addWidget(ctx.plot, 1);
+    frameLayout->setSizeConstraint(QLayout::SetMinAndMaxSize);
     ctx.scope = new PlotMeasurementController(ctx.plot, frame, [this](int channel) { return channelUnit(channel); }, [this] { return lastLatestTime; });
     frameLayout->addWidget(ctx.scope->panel()); ctx.dock->setWidget(frame);
     connect(ctx.scope, &PlotMeasurementController::activated, this, [this, plot = ctx.plot] {
@@ -338,11 +370,14 @@ MainWindow::PlotContext MainWindow::createNewPlotContext(const QString &title, b
             break;
         }
     });
-    connect(ctx.scope, &PlotMeasurementController::visibilityChanged, this, [this](bool visible) {
-        bool any = visible;
-        for (const auto &context : allPlots) if (context.scope && context.scope->isEnabled()) any = true;
-        if (plotScrollArea) plotScrollArea->setMeasurementBarsVisible(any);
+    connect(ctx.scope, &PlotMeasurementController::visibilityAboutToChange, this, [this](bool visible) {
+        if (!visible || m_measurementPlotHeightsLocked || allPlots.size() < 2 || !plotScrollArea->isVisible()) return;
+        // Capture the current splitter sizes before showing the first panel.
+        for (const auto &context : allPlots) context.plot->setFixedHeight(context.plot->height());
+        m_measurementPlotHeightsLocked = true;
     });
+    connect(ctx.scope, &PlotMeasurementController::visibilityChanged, this, &MainWindow::updatePlotMeasurementLayout);
+    m_globalTimeMeasurement->addPlot(ctx.plot);
     if (isMain) ctx.scope->setPreferenceKey("ScopeMeasurements/Main");
     if (isMain) {
         ctx.dock->setFeatures(QDockWidget::DockWidgetMovable);
@@ -352,20 +387,25 @@ MainWindow::PlotContext MainWindow::createNewPlotContext(const QString &title, b
     }
     // Use the active selection, not an unrelated/stale settings namespace.
     // Apply after initializing axes so hard-coded setup colors cannot undo it.
-    applyWaveformPlotTheme(ctx.plot, isMain);
+    applyWaveformPlotTheme(ctx, isMain);
     return ctx;
 }
 
-void MainWindow::applyWaveformPlotTheme(QCustomPlot *plot, bool isMain)
+void MainWindow::applyWaveformPlotTheme(const PlotContext &ctx, bool isMain)
 {
     const int theme = comboTheme ? comboTheme->currentData().toInt() : QSettings("WaveLink", "WaveLink").value("comboTheme", 0).toInt();
-    ThemeManager::setupPlotTheme(plot, static_cast<ThemeManager::Theme>(theme), isMain ? m_mainPlotBackground : m_detachedPlotBackground);
+    ThemeManager::setupPlotTheme(ctx.plot, static_cast<ThemeManager::Theme>(theme), isMain ? m_mainPlotBackground : m_detachedPlotBackground);
+    if (auto hint = ctx.noChannelsSelectedText) {
+        hint->setColor(ctx.plot->xAxis->labelColor());
+        hint->setBrush(ctx.plot->axisRect()->backgroundBrush());
+        hint->setPen(QPen(ctx.plot->xAxis->grid()->pen().color()));
+    }
 }
 
 void MainWindow::updateWaveformPlotThemes()
 {
     for (int i = 0; i < allPlots.size(); ++i) {
-        applyWaveformPlotTheme(allPlots[i].plot, i == 0);
+        applyWaveformPlotTheme(allPlots[i], i == 0);
         allPlots[i].plot->replot(QCustomPlot::rpQueuedReplot);
     }
 }
@@ -1055,6 +1095,7 @@ void MainWindow::onSelectAllChannelsStateChanged(int state)
     for (QCPGraph *g : channelGraphs) {
         g->setVisible(checked);
     }
+    if (!channelGraphs.isEmpty()) updateChannelSelectionSummary();
     // Channel checkboxes control only the retained graphs in the main view.
     if (!allPlots.isEmpty() && allPlots[0].scope) allPlots[0].scope->refresh();
     if (!allPlots.isEmpty()) allPlots[0].plot->replot();
@@ -1072,6 +1113,7 @@ void MainWindow::onChannelItemChanged(QListWidgetItem *item)
             if (chk) isChecked = chk->isChecked();
         }
         channelGraphs[index]->setVisible(isChecked);
+        updateChannelSelectionSummary();
         if (!allPlots.isEmpty() && allPlots[0].scope) allPlots[0].scope->refresh();
         QSettings settings("WaveLink", "AdvancedApp");
         settings.setValue(channelSettingKey(index, "Visible"), isChecked);
@@ -1083,24 +1125,23 @@ void MainWindow::onChannelItemChanged(QListWidgetItem *item)
             autoScaleY();
         }
     }
-    updateChannelSelectionSummary();
 }
 void MainWindow::updateChannelSelectionSummary()
 {
-    if (!chkSelectAllChannels || !listChannels) return;
+    if (!chkSelectAllChannels) return;
     const QSignalBlocker blocker(chkSelectAllChannels);
-    bool allChecked = true;
-    for (int i = 0; i < listChannels->count(); ++i) {
-        QWidget *w = listChannels->itemWidget(listChannels->item(i));
-        if (w) {
-            QCheckBox *chk = w->findChild<QCheckBox*>("chkChannel");
-            if (chk && !chk->isChecked()) {
-                allChecked = false;
-                break;
-            }
+    const auto selected = std::count_if(channelGraphs.cbegin(), channelGraphs.cend(),
+                                        [](const QCPGraph *graph) { return graph->visible(); });
+    chkSelectAllChannels->setChecked(selected == channelGraphs.size());
+    // Until channels exist there is nothing for the user to select.
+    const bool showHint = !channelGraphs.isEmpty() && selected == 0;
+    if (!allPlots.isEmpty()) {
+        const auto &main = allPlots.first();
+        if (main.noChannelsSelectedText && main.noChannelsSelectedText->visible() != showHint) {
+            main.noChannelsSelectedText->setVisible(showHint);
+            main.plot->replot(QCustomPlot::rpQueuedReplot);
         }
     }
-    chkSelectAllChannels->setChecked(allChecked);
 }
 void MainWindow::scrollToLatest()
 {
@@ -1168,6 +1209,20 @@ void MainWindow::applyPlotTimeRange(const QCPRange &viewRange)
     if (!yScaleTimer->isActive()) {
         yScaleTimer->start(66); // coalesce range changes, keep autoscale active while dragging
     }
+}
+
+void MainWindow::locateGlobalTimeInterval(double lower, double upper)
+{
+    if (allPlots.isEmpty()) return;
+    stopOfflinePlayback();
+    m_autoScroll = false;
+    const double first = qMin(lower, m_isImportedData ? offlineFirstTime() : 0.0);
+    const double last = qMax(upper, lastLatestTime);
+    const double span = upper - lower;
+    const double width = qMax(qMin(allPlots.first().plot->xAxis->range().size(), qMax(.001, last - first)), span * 1.2);
+    const double centered = lower - (width - span) / 2;
+    const double start = last - first >= width ? qBound(first, centered, last - width) : centered;
+    applyPlotTimeRange(QCPRange(start, start + width));
 }
 void MainWindow::autoScaleY()
 {
@@ -1276,7 +1331,7 @@ void MainWindow::moveChannelToNewPlot(int chIdx)
     dataCopy->set(*mainGraph->data());
     newGraph->setData(dataCopy);
     channelToPlotMap[chIdx] = newPlotIdx;
-    ctx.scope->setPreferenceKey("ScopeMeasurements/Views/" + channelSettingKey(chIdx, "Measure"));
+    ctx.scope->setPreferenceKey("ScopeMeasurements/Views/" + channelSettingKey(chIdx, "Measure"), /*rememberVisibility=*/false);
     if (plotScrollArea) plotScrollArea->setDetachedViewCount(allPlots.size() - 1);
     
     // Sync X axis with the main view (block signals to avoid re-entrancy crash!)
@@ -1338,8 +1393,54 @@ void MainWindow::moveChannelToMainPlot(int chIdx)
     if (chkAutoScaleY && chkAutoScaleY->isChecked()) autoScaleY();
     QTimer::singleShot(10, this, &MainWindow::equalizePlotHeights);
 }
+
+bool MainWindow::isPlotHeightSeparator(const QPoint &position) const
+{
+    const int extent = innerMainWindow->style()->pixelMetric(QStyle::PM_DockWidgetSeparatorExtent, nullptr, innerMainWindow);
+    int above = extent + 1;
+    int below = extent + 1;
+    // The gap between two fixed docks may not be a resizable Qt separator.
+    for (const auto &context : allPlots) {
+        const auto dock = context.dock;
+        if (!dock->isVisible() || dock->isFloating()) continue;
+        const QRect bounds = dock->geometry();
+        if (position.x() < bounds.left() || position.x() > bounds.right()) continue;
+        if (position.y() > bounds.bottom()) above = qMin(above, position.y() - bounds.bottom());
+        else if (position.y() < bounds.top()) below = qMin(below, bounds.top() - position.y());
+        else return false;
+    }
+    return above + below <= extent + 1;
+}
+
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
+    if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonDblClick) {
+        const auto mouse = static_cast<QMouseEvent *>(event);
+        if (mouse->button() == Qt::LeftButton) {
+            m_manualPlotResizePressY.reset();
+            if (m_detachedWaveformHeight > 0 && allPlots.size() > 1 &&
+                (watched == innerMainWindow || watched->parent() == innerMainWindow) &&
+                isPlotHeightSeparator(innerMainWindow->mapFromGlobal(mouse->globalPos()))) {
+                m_manualPlotResizePressY = mouse->globalY();
+                return true;
+            }
+        }
+    } else if (event->type() == QEvent::MouseButtonRelease && m_manualPlotResizePressY) {
+        const auto mouse = static_cast<QMouseEvent *>(event);
+        if (mouse->button() == Qt::LeftButton) {
+            const int distance = qAbs(mouse->globalY() - *m_manualPlotResizePressY);
+            m_manualPlotResizePressY.reset();
+            if (distance >= QApplication::startDragDistance())
+                QTimer::singleShot(0, this, &MainWindow::showDetachedHeightDragHint);
+            return true;
+        }
+    }
+    if (plotScrollArea && watched == plotScrollArea->viewport() && event->type() == QEvent::Resize &&
+        m_measurementPlotHeightsLocked) {
+        const auto resize = static_cast<QResizeEvent *>(event);
+        if (resize->size().height() != resize->oldSize().height())
+            QTimer::singleShot(0, this, &MainWindow::equalizePlotHeights);
+    }
     if (event->type() == QEvent::Show && qobject_cast<QCustomPlot *>(watched)) {
         for (const auto &ctx : allPlots) if (ctx.plot == watched) {
             ctx.plot->replot(QCustomPlot::rpQueuedReplot);
@@ -1606,6 +1707,7 @@ void MainWindow::onPlotDockClosedEvent(QDockWidget *closedDock)
     if (plotIdx <= 0) return; // 0 is main view or not found
     // Move all graphs back to plot 0
     QCustomPlot *oldPlot = allPlots[plotIdx].plot;
+    auto scope = allPlots[plotIdx].scope;
     QCustomPlot *mainPlot = allPlots[0].plot;
     QList<int> channelsToMove;
     for (auto it = channelToPlotMap.begin(); it != channelToPlotMap.end(); ++it) {
@@ -1632,7 +1734,7 @@ void MainWindow::onPlotDockClosedEvent(QDockWidget *closedDock)
             it.value() = it.value() - 1;
         }
     }
-    if (plotScrollArea) plotScrollArea->setDetachedViewCount(allPlots.size() - 1);
+    if (scope) scope->setEnabled(false);
     enforcePlotHistoryLimit(true);
     QTimer::singleShot(0, this, &MainWindow::equalizePlotHeights);
 }
@@ -1706,6 +1808,7 @@ void MainWindow::onRequestClearPlots()
 
 void MainWindow::onClearPlots()
 {
+    m_globalTimeMeasurement->resetData();
     leaveImportedDataMode();
 
     for (int i = 0; i < channelGraphs.size(); ++i) {
@@ -1749,25 +1852,152 @@ void MainWindow::onClearPlots()
     if (!allPlots.isEmpty()) syncTimeRangeSlider(allPlots[0].plot->xAxis->range());
     enforcePlotHistoryLimit(true);
 }
-void MainWindow::equalizePlotHeights()
+bool MainWindow::hasActivePlotMeasurements() const
 {
-    bool measurements = false;
-    for (const auto &context : allPlots) if (context.scope && context.scope->isEnabled()) measurements = true;
-    if (plotScrollArea) plotScrollArea->setMeasurementBarsVisible(measurements);
-    if (plotScrollArea) plotScrollArea->setDetachedViewCount(allPlots.size() - 1);
-    QList<QDockWidget*> docks;
-    for (const PlotContext &ctx : allPlots) {
-        if (ctx.dock) {
-            docks.append(ctx.dock);
+    return std::any_of(allPlots.cbegin(), allPlots.cend(), [](const PlotContext &context) {
+        return context.scope && context.scope->isEnabled();
+    });
+}
+
+void MainWindow::syncPlotStackSizing(bool measurementsVisible)
+{
+    for (const auto &context : allPlots) context.dock->widget()->layout()->activate();
+    innerMainWindow->layout()->invalidate();
+    plotScrollArea->setPlotSizing(allPlots.size() - 1, allPlots.size() > 1 && m_detachedWaveformHeight > 0,
+        measurementsVisible);
+    innerMainWindow->layout()->activate();
+}
+
+void MainWindow::updatePlotMeasurementLayout()
+{
+    if (allPlots.isEmpty()) return;
+    if (hasActivePlotMeasurements()) {
+        if (m_measurementPlotHeightsLocked || allPlots.size() == 1) syncPlotStackSizing(true);
+        else equalizePlotHeights();
+        return;
+    }
+
+    if (!m_measurementPlotHeightsLocked) {
+        syncPlotStackSizing(false);
+        return;
+    }
+    m_measurementPlotHeightsLocked = false;
+    QList<QDockWidget *> docks;
+    QList<int> sizes;
+    for (int i = 0; i < allPlots.size(); ++i) {
+        const auto &context = allPlots[i];
+        docks.append(context.dock);
+        sizes.append(context.plot->height() + plotDockChromeHeight(context.dock));
+        if (i == 0 || m_detachedWaveformHeight == 0) {
+            context.plot->setMinimumHeight(i == 0 && m_detachedWaveformHeight > 0 && allPlots.size() > 1 ? MinimumWaveformHeight : 0);
+            context.plot->setMaximumHeight(QWIDGETSIZE_MAX);
         }
     }
-    if (docks.isEmpty()) return;
-    QList<int> sizes;
-    int h = innerMainWindow->height() / docks.size();
-    for (int i = 0; i < docks.size(); ++i) {
-        sizes.append(h);
-    }
+    syncPlotStackSizing(false);
     innerMainWindow->resizeDocks(docks, sizes, Qt::Vertical);
+}
+
+void MainWindow::equalizePlotHeights()
+{
+    if (allPlots.isEmpty()) return;
+    const int count = allPlots.size();
+    const bool manual = count > 1 && m_detachedWaveformHeight > 0;
+    const bool measurements = hasActivePlotMeasurements();
+    // A single plot shares the viewport with its panel. Only multiple plots
+    // reserve additional scroll space to preserve their waveform heights.
+    m_measurementPlotHeightsLocked = count > 1 && measurements;
+    const int baseHeight = qMax(plotScrollArea->viewport()->height(),
+        manual ? 0 : PlotScrollArea::automaticStackMinimumHeight(count - 1));
+    int available = baseHeight - (count - 1) * innerMainWindow->style()->pixelMetric(QStyle::PM_DockWidgetSeparatorExtent, nullptr, innerMainWindow);
+    for (const auto &context : allPlots) available -= plotDockChromeHeight(context.dock);
+
+    QList<QDockWidget *> docks;
+    QList<int> sizes;
+    for (int i = 0; i < count; ++i) {
+        const auto &context = allPlots[i];
+        const int naturalMinimum = static_cast<QWidget *>(context.plot)->minimumSizeHint().height();
+        const int waveformHeight = manual
+            ? (i == 0 ? qMax(MinimumWaveformHeight, available - (count - 1) * m_detachedWaveformHeight) : m_detachedWaveformHeight)
+            : qMax(naturalMinimum, available / count + (i < available % count ? 1 : 0));
+        if (m_measurementPlotHeightsLocked || (manual && i > 0)) {
+            context.plot->setFixedHeight(waveformHeight);
+        } else {
+            context.plot->setMinimumHeight(manual ? MinimumWaveformHeight : 0);
+            context.plot->setMaximumHeight(QWIDGETSIZE_MAX);
+        }
+        docks.append(context.dock);
+        sizes.append(waveformHeight + plotDockChromeHeight(context.dock));
+    }
+    syncPlotStackSizing(measurements);
+    if (!measurements) innerMainWindow->resizeDocks(docks, sizes, Qt::Vertical);
+}
+
+void MainWindow::setDetachedWaveformHeight(int height)
+{
+    height = height > 0 ? qBound(MinimumWaveformHeight, height, MaximumDetachedWaveformHeight) : 0;
+    if (m_detachedWaveformHeight == height) return;
+    m_detachedWaveformHeight = height;
+    equalizePlotHeights();
+}
+
+void MainWindow::showDetachedHeightDragHint()
+{
+    if (m_detachedWaveformHeight <= 0 || allPlots.size() < 2) return;
+    QDialog dialog(this);
+    dialog.setObjectName("detachedHeightDragHint");
+    dialog.setWindowTitle(QStringLiteral("独立视图高度已固定"));
+    dialog.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+    auto layout = new QVBoxLayout(&dialog);
+    QString text = QStringLiteral("当前高度模式为“手动设置”（%1 像素）。\n"
+        "如需拖动分隔条调整高度，请右键单击波形区，选择“独立视图默认高度…”，将高度模式改为“自适应”。")
+        .arg(m_detachedWaveformHeight);
+    if (m_measurementPlotHeightsLocked)
+        text += QStringLiteral("\n当前有测量栏打开，切换后请关闭测量栏再拖动。");
+    auto hint = new QLabel(text, &dialog);
+    hint->setWordWrap(true);
+    layout->addWidget(hint);
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    auto settings = buttons->addButton(QStringLiteral("打开高度设置"), QDialogButtonBox::ActionRole);
+    settings->setObjectName("openDetachedHeightSettings");
+    connect(settings, &QPushButton::clicked, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    if (dialog.exec() == QDialog::Accepted) showDetachedHeightSettings();
+}
+
+void MainWindow::showDetachedHeightSettings()
+{
+    QDialog dialog(this);
+    dialog.setObjectName("detachedHeightSettings");
+    dialog.setWindowTitle(QStringLiteral("独立视图默认高度"));
+    dialog.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+    auto layout = new QVBoxLayout(&dialog);
+    auto fields = new QFormLayout;
+    auto mode = new QComboBox(&dialog);
+    mode->setObjectName("detachedHeightMode");
+    mode->addItems({QStringLiteral("自适应"), QStringLiteral("手动设置")});
+    mode->setCurrentIndex(m_detachedWaveformHeight > 0 ? 1 : 0);
+    fields->addRow(QStringLiteral("高度模式"), mode);
+    auto height = new QSpinBox(&dialog);
+    height->setObjectName("detachedWaveformHeight");
+    height->setRange(MinimumWaveformHeight, MaximumDetachedWaveformHeight);
+    height->setSuffix(QStringLiteral(" 像素"));
+    height->setValue(m_detachedWaveformHeight > 0 ? m_detachedWaveformHeight : SuggestedDetachedWaveformHeight);
+    height->setEnabled(mode->currentIndex() == 1);
+    fields->addRow(QStringLiteral("波形区高度"), height);
+    layout->addLayout(fields);
+    auto hint = new QLabel(QStringLiteral("手动设置会固定独立视图高度，建议 %1 像素。自适应模式下，关闭测量栏后可拖动分隔条调整高度。")
+        .arg(SuggestedDetachedWaveformHeight), &dialog);
+    hint->setWordWrap(true);
+    layout->addWidget(hint);
+    connect(mode, QOverload<int>::of(&QComboBox::currentIndexChanged), height, [height](int index) { height->setEnabled(index == 1); });
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+    setDetachedWaveformHeight(mode->currentIndex() == 1 ? height->value() : 0);
+    QSettings("WaveLink", "WaveLink").setValue("Plot/DetachedWaveformHeight", m_detachedWaveformHeight);
 }
 
 
@@ -1901,13 +2131,20 @@ void MainWindow::onPlotContextMenu(const QPoint &pos)
     if (targetPlotIdx < 0) return;
     
     QMenu menu(this);
-    if (allPlots[targetPlotIdx].scope) allPlots[targetPlotIdx].scope->appendMenu(&menu);
+    if (auto scope = allPlots[targetPlotIdx].scope)
+        m_globalTimeMeasurement->appendMenu(scope->appendMenu(&menu), clickedPlot);
+    const auto addHeightSettings = [&] {
+        auto action = menu.addAction(QStringLiteral("独立视图默认高度…"));
+        action->setObjectName("detachedHeightAction");
+        connect(action, &QAction::triggered, this, &MainWindow::showDetachedHeightSettings);
+    };
     if (targetPlotIdx == 0) {
         menu.addSeparator();
         menu.setToolTipsVisible(true);
         auto backgroundAction = menu.addAction(QStringLiteral("绘图背景颜色…"));
         backgroundAction->setObjectName("plotBackgroundAction");
         connect(backgroundAction, &QAction::triggered, this, &MainWindow::showPlotBackgroundSettings);
+        addHeightSettings();
         menu.addSeparator();
         auto importAction = menu.addAction(QStringLiteral("导入数据…"));
         importAction->setObjectName("plotImportAction");
@@ -1945,6 +2182,7 @@ void MainWindow::onPlotContextMenu(const QPoint &pos)
     connect(moveDown, &QAction::triggered, this, [this, targetDock] {
         if (targetDock) moveDetachedPlot(targetDock, 1);
     });
+    addHeightSettings();
     menu.addSeparator();
     QMenu *addMenu = menu.addMenu("添加通道显示");
     QMenu *removeMenu = menu.addMenu("移除通道显示");

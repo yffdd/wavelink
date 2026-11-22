@@ -577,8 +577,12 @@ static int consoleInteractionTests(const QString &directory, OffscreenMessages &
         window.findChild<QTimer *>("serialHardwareCheckTimer")->stop();
         auto rxSave = window.findChild<QPushButton *>("btnSaveReceive"), rxCopy = window.findChild<QPushButton *>("btnCopyReceive"), rxClear = window.findChild<QPushButton *>("btnClearReceive");
         auto txClear = window.findChild<QPushButton *>("btnClearSend");
+        auto txEcho = window.findChild<QCheckBox *>("chkShowTransmitData");
+        VERIFY(txEcho && !txEcho->isChecked());
         VERIFY(rxSave && rxCopy && rxClear && rxSave->text() == "保存接收" && rxCopy->text() == "复制接收");
         VERIFY(until([&] { return rxSave->mapTo(&window, QPoint()).x() < rxCopy->mapTo(&window, QPoint()).x()
+            && txEcho->mapTo(&window, txEcho->rect().center()).x() < rxSave->mapTo(&window, QPoint()).x()
+            && qAbs(txEcho->mapTo(&window, txEcho->rect().center()).y() - rxSave->mapTo(&window, rxSave->rect().center()).y()) <= 2
             && rxSave->mapTo(&window, QPoint()).y() > rxClear->mapTo(&window, QPoint()).y() + rxClear->height() / 2
             && rxSave->mapTo(&window, QPoint()).y() == rxCopy->mapTo(&window, QPoint()).y()
             && periodic->mapTo(&window, QPoint()).x() < interval->mapTo(&window, QPoint()).x()
@@ -618,9 +622,20 @@ static int consoleInteractionTests(const QString &directory, OffscreenMessages &
         auto ports = window.findChild<QComboBox *>("comboPorts"); ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY");
         open->click(); VERIFY(until([&] { return periodic->isEnabled(); }));
         auto written = [&] { QByteArray bytes; QMetaObject::invokeMethod(worker, [&] { bytes = port->written; }, Qt::BlockingQueuedConnection); return bytes; };
+        rxClear->click(); send->setPlainText("HIDDEN"); sendButton->click();
+        VERIFY(until([&] { return written().endsWith("HIDDEN\r\n"); }));
+        VERIFY(QMetaObject::invokeMethod(&window, "flushReceiveText") && receive->toPlainText().isEmpty());
+        txEcho->setChecked(true);
+        VERIFY(feed(worker, port, "device") && until([&] { return receive->toPlainText() == "device"; }));
+        send->setPlainText(QStringLiteral("回显")); sendButton->click();
+        VERIFY(until([&] { return receive->toPlainText() == "device\n[TX] 回显\n"; }));
+        auto rxHex = window.findChild<QCheckBox *>("chkHexReceive"); VERIFY(rxHex);
+        rxHex->click(); VERIFY(receive->toPlainText() == "device\n[TX] 回显\n");
+        rxHex->click();
         interval->setValue(10); send->setPlainText("PING"); periodic->setChecked(true);
         VERIFY(timer->isActive() && until([&] { return written().count("PING\r\n") >= 3; }));
         periodic->setChecked(false); const auto stoppedBytes = written(); pump(40); VERIFY(written() == stoppedBytes && !timer->isActive());
+        VERIFY(until([&] { return receive->toPlainText().contains("[TX] PING\n"); }));
         append->setCurrentIndex(3); send->setPlainText("中文"); periodic->setChecked(true);
         VERIFY(until([&] { return written().endsWith(QString("中文\r").toUtf8()); }));
         interval->setValue(1000); VERIFY(timer->interval() == 1000);
@@ -628,6 +643,7 @@ static int consoleInteractionTests(const QString &directory, OffscreenMessages &
         hex->setChecked(true); append->setCurrentIndex(0); send->setPlainText("aa 55"); periodic->setChecked(true);
         VERIFY(timer->isActive()); QMetaObject::invokeMethod(&window, "onConsolePeriodicSendTimer");
         VERIFY(until([&] { return written().endsWith(QByteArray::fromHex("AA55")); }));
+        VERIFY(until([&] { return receive->toPlainText().endsWith("[TX] AA 55\n"); }));
         const auto beforeOdd = written(); send->setPlainText("A"); QMetaObject::invokeMethod(&window, "onConsolePeriodicSendTimer");
         VERIFY(!timer->isActive() && !periodic->isChecked() && written() == beforeOdd && window.statusBar()->currentMessage().contains("完整"));
         send->setPlainText("AA"); periodic->setChecked(true);
@@ -639,6 +655,8 @@ static int consoleInteractionTests(const QString &directory, OffscreenMessages &
         window.findChild<QLineEdit *>("txtSendFilePath")->setText(filePath); periodic->setChecked(true);
         window.findChild<QPushButton *>("btnSendFile")->click(); VERIFY(!periodic->isChecked() && !timer->isActive());
         VERIFY(until([&] { return periodic->isEnabled() && written().endsWith("FILE"); }));
+        VERIFY(until([&] { return receive->toPlainText().endsWith("[TX] 46 49 4C 45\n"); }));
+        txEcho->setChecked(false);
         hex->setChecked(false); send->setPlainText(QString(80000, 'X')); interval->setValue(10);
         QMetaObject::invokeMethod(worker, [port] { port->holdWrites = true; }, Qt::BlockingQueuedConnection);
         periodic->setChecked(true); VERIFY(until([&] { return !timer->isActive(); }));
@@ -646,6 +664,8 @@ static int consoleInteractionTests(const QString &directory, OffscreenMessages &
         open->click(); VERIFY(until([&] { return window.findChild<QComboBox *>("comboInterface")->isEnabled(); }));
         VERIFY(!periodic->isChecked() && !timer->isActive());
         QMetaObject::invokeMethod(worker, [port] { port->holdWrites = false; }, Qt::BlockingQueuedConnection);
+        // A hardware refresh while disconnected can remove the test port.
+        ports->clear(); ports->addItem("SOFTWARE_ONLY", "SOFTWARE_ONLY");
         send->setPlainText("again"); open->click(); VERIFY(until([&] { return periodic->isEnabled(); }));
         pump(40); VERIFY(!periodic->isChecked() && !timer->isActive()); periodic->setChecked(true);
         open->click(); VERIFY(until([&] { return !periodic->isChecked() && !timer->isActive(); }));
@@ -829,14 +849,62 @@ static int networkUiTests(const QString &directory, OffscreenMessages &messages)
         VERIFY(until([&] { return open->text().contains("重新") && messages.lastTitle == "打开失败"; }));
         VERIFY(serverIP->currentText() == "not-an-ip" && serverIP->isEnabled() && messages.lastText.contains("监听 IP"));
         QTcpServer reserve; VERIFY(reserve.listen(QHostAddress::LocalHost, 0)); const auto listenPort = reserve.serverPort(); reserve.close();
+        auto protocol = window.findChild<QComboBox *>("comboProtocol");
+        protocol->setCurrentIndex(protocol->findData("builtin.firewater"));
+        VERIFY(until([&] { return open->isEnabled() && protocol->currentData().toString() == "builtin.firewater"; }));
         serverIP->setCurrentText("127.0.0.1"); serverPort->setValue(listenPort); open->click();
         VERIFY(until([&] { return open->text().contains("关闭服务器"); }) && !serverIP->isEnabled() && !serverPort->isEnabled());
+        auto status = window.findChild<QLabel *>("lblStatusMessage");
+        auto periodic = window.findChild<QCheckBox *>("chkConsolePeriodicSend");
+        VERIFY(status && periodic && status->text().contains("等待设备连接") && !periodic->isEnabled());
         QTcpSocket peerClient; peerClient.connectToHost(QHostAddress::LocalHost, listenPort);
-        VERIFY(until([&] { return peerClient.state() == QAbstractSocket::ConnectedState && window.findChild<QCheckBox *>("chkConsolePeriodicSend")->isEnabled(); }));
+        VERIFY(until([&] { return peerClient.state() == QAbstractSocket::ConnectedState && periodic->isEnabled(); }));
+        VERIFY(status->text().contains("客户端已连接"));
         window.findChild<QCheckBox *>("chkHexSend")->setChecked(false); window.findChild<QComboBox *>("comboAppendNewline")->setCurrentIndex(0);
         window.findChild<QTextEdit *>("textSend")->setPlainText("SERVER"); window.findChild<QPushButton *>("btnSend")->click();
         VERIFY(until([&] { return peerClient.bytesAvailable() == 6; }) && peerClient.readAll() == "SERVER");
+        const QString recordingFolder = directory + "/tcp-reconnect";
+        VERIFY(QDir().mkpath(recordingFolder));
+        window.findChild<QLineEdit *>("editCacheDir")->setText(recordingFolder);
+        window.findChild<QComboBox *>("comboRecordingMode")->setCurrentIndex(1);
+        window.findChild<QCheckBox *>("chkHexReceive")->setChecked(false);
+        auto record = window.findChild<QPushButton *>("btnToggleRecord");
+        auto receive = window.findChild<QPlainTextEdit *>("textReceive");
+        VERIFY(record && receive);
+        record->click();
+        VERIFY(record->text().contains("停止录制"));
+        QDir cache(recordingFolder + "/WaveLink_Cache");
+        VERIFY(peerClient.write("10,20\n") == 6);
+        VERIFY(until([&] { return cache.entryList({"*.wlr.part"}, QDir::Files).size() == 1; }));
+        peerClient.abort();
+        VERIFY(until([&] { return status->text().contains("等待设备连接") && !periodic->isEnabled(); }));
+        auto notice = window.findChild<QDialog *>("tcpServerPeerNotice");
+        auto noticeText = window.findChild<QLabel *>("tcpServerPeerNoticeText");
+        VERIFY(notice && noticeText && notice->isVisible() && !notice->isModal() && notice->windowTitle().contains("已断开"));
+        VERIFY(noticeText->text().contains("录制仍在进行") && record->text().contains("停止录制"));
+        VERIFY(open->text().contains("关闭服务器"));
+        peerClient.connectToHost(QHostAddress::LocalHost, listenPort);
+        VERIFY(until([&] { return status->text().contains("客户端已连接") && periodic->isEnabled(); }));
+        VERIFY(notice->isVisible() && notice->windowTitle().contains("已恢复"));
+        window.findChild<QPushButton *>("btnSend")->click();
+        VERIFY(until([&] { return peerClient.bytesAvailable() == 6; }) && peerClient.readAll() == "SERVER");
+        VERIFY(peerClient.write("30,40\n") == 6);
+        VERIFY(until([&] { return receive->toPlainText().contains("30,40"); }));
+        peerClient.disconnectFromHost();
+        VERIFY(until([&] { return notice->windowTitle().contains("已断开"); }));
+        VERIFY(window.findChildren<QDialog *>("tcpServerPeerNotice").size() == 1);
+        record->click();
+        VERIFY(record->text().contains("开始录制") && notice->isVisible() && !noticeText->text().contains("录制仍在进行"));
+        const auto recordings = cache.entryList({"*.wlr"}, QDir::Files);
+        VERIFY(recordings.size() == 1 && cache.entryList({"*.wlr.part"}, QDir::Files).isEmpty());
+        QVector<QVector<double>> frames;
+        VERIFY(WlrRecordingWriter::visitFiles({cache.filePath(recordings.first())}, [&](qint64, const QVector<double> &values, qint64) {
+            frames.append(values);
+            return true;
+        }, error));
+        VERIFY(frames == QVector<QVector<double>>({{10, 20}, {30, 40}}));
         open->click(); VERIFY(until([&] { return role->isEnabled(); }));
+        VERIFY(!notice->isVisible());
         remoteIP->setText("127.0.0.1"); remotePort->setValue(32123); localIP->setCurrentText("127.0.0.1"); localPort->setValue(24680);
         serverIP->setCurrentText("127.0.0.1"); serverPort->setValue(35400);
         VERIFY(advanced.value("NetworkLocalIP").toString() == "127.0.0.1" && advanced.value("NetworkLocalPort").toInt() == 24680
@@ -1121,10 +1189,11 @@ static int plotInteractionTests() {
     std::cout << "12-channel long history: slider/drag autoscale, coalesced rendering, full-resolution data and detached views passed.\n";
     return 0;
 }
-static int interfaceHintsUiTests() {
+static int interfaceHintsUiTests(OffscreenMessages &messages) {
     QTemporaryDir directory; VERIFY(directory.isValid()); QString error;
     QSettings main("WaveLink", "WaveLink"), advanced("WaveLink", "AdvancedApp");
     main.setValue("editCacheDir", directory.path()); main.sync();
+    main.setValue("comboBaudRate", 5); // Legacy 460800 selection.
     ProtocolProfileStore store; VERIFY(store.load(error) && store.setSelection(ProtocolSelection::fromLegacy(0), error));
     for (int saved : {5, 4}) {
         advanced.setValue("InterfaceType", saved); advanced.sync();
@@ -1132,7 +1201,16 @@ static int interfaceHintsUiTests() {
         auto interfaces = host.findChild<QComboBox *>("comboInterface");
         auto stack = host.findChild<QStackedWidget *>("stackInterface");
         auto label = host.findChild<QLabel *>("interfaceTypeLabel");
+        auto protocol = host.findChild<QComboBox *>("comboProtocol");
+        auto demoProtocolInfo = host.findChild<QPushButton *>("btnDemoProtocolInfo");
+        auto open = host.findChild<QPushButton *>("btnOpenClose");
+        auto baudRate = host.findChild<QComboBox *>("comboBaudRate");
+        VERIFY(baudRate && baudRate->currentText() == (saved == 5 ? "460800" : "230400"));
+        const int newRate = baudRate->findText("230400");
+        VERIFY(newRate > 0 && baudRate->itemText(newRate - 1) == "115200" && baudRate->itemText(newRate + 1) == "460800");
+        baudRate->setCurrentIndex(newRate);
         VERIFY(interfaces && stack && label && interfaces->currentData().toInt() == saved && stack->currentIndex() == saved);
+        VERIFY(protocol && demoProtocolInfo && open && demoProtocolInfo->isHidden());
         VERIFY(interfaces->count() == 6 && interfaces->itemText(3) == "UDP 用户数据报" &&
                interfaces->itemText(4) == "BLE 低功耗蓝牙" && interfaces->itemText(5) == "Demo数据");
         VERIFY(label->toolTip() == interfaces->toolTip());
@@ -1153,8 +1231,28 @@ static int interfaceHintsUiTests() {
                 if (caption->toolTip().isEmpty()) std::cerr << "Missing connection hint: id=" << id << " label=" << caption->text().toStdString() << "\n";
                 VERIFY(!caption->toolTip().isEmpty() && caption->toolTip().size() < 180); ++hinted;
             }
+            // BLE status spans the form so it remains readable in narrow sidebars.
+            if (id == 4) {
+                auto status = page->findChild<QLabel *>("bleConnectionStatus");
+                VERIFY(status && !status->toolTip().isEmpty() && status->toolTip().size() < 180);
+                ++hinted;
+            }
             VERIFY(hinted >= 2 && advanced.value("InterfaceType").toInt() == id);
             if (id == 0) VERIFY(host.findChild<QCheckBox *>("chkDtr")->toolTip().contains("复位"));
+            if (id == 3) {
+                VERIFY(until([&] { return open->isEnabled(); }));
+                const auto selectedProtocol = protocol->currentData();
+                for (bool running : {false, true}) {
+                    VERIFY(open->text().contains(running ? "停止 Demo" : "启动 Demo"));
+                    VERIFY(protocol->isHidden() && !protocol->isEnabled() && demoProtocolInfo->isVisible() && demoProtocolInfo->isEnabled());
+                    messages.lastTitle.clear();
+                    demoProtocolInfo->click();
+                    VERIFY(messages.lastTitle == "Demo 数据说明" && messages.lastText.contains("无需选择数据协议"));
+                    VERIFY(protocol->currentData() == selectedProtocol);
+                    open->click();
+                }
+                VERIFY(open->text().contains("启动 Demo"));
+            }
             for (auto theme : {ThemeManager::LightTheme, ThemeManager::DarkTheme}) {
                 ThemeManager::applyTheme(qApp, theme); QCoreApplication::processEvents();
                 if (saved == 5) {
@@ -1164,7 +1262,9 @@ static int interfaceHintsUiTests() {
                 }
             }
         }
-        interfaces->setCurrentIndex(interfaces->findData(saved)); host.close();
+        interfaces->setCurrentIndex(interfaces->findData(saved));
+        VERIFY(until([&] { return demoProtocolInfo->isHidden() && protocol->isVisible() && protocol->isEnabled(); }));
+        host.close();
     }
     std::cout << "Connection interface UI: order/names, stable legacy IDs, startup restore and short label hints on all pages passed.\n";
     return 0;
@@ -1210,6 +1310,34 @@ static int receiveCacheUiTests() {
         VERIFY(receive->toPlainText().startsWith("004101,2.5\n"));
         host.findChild<QPushButton *>("btnClearReceive")->click();
         VERIFY(feed(worker, port, QString("温度正常\n").toUtf8()) && until([&] { return receive->toPlainText() == "温度正常\n"; }));
+        auto clearReceive = host.findChild<QPushButton *>("btnClearReceive");
+        const auto formatAt = [&](int position) {
+            QTextCursor cursor(receive->document());
+            cursor.setPosition(position);
+            cursor.movePosition(QTextCursor::NextCharacter, QTextCursor::KeepAnchor);
+            return cursor.charFormat();
+        };
+        clearReceive->click();
+        VERIFY(feed(worker, port, "start\x1b[3") && until([&] { return receive->toPlainText() == "start"; }));
+        VERIFY(feed(worker, port, "1m" + QStringLiteral("红").toUtf8()) && until([&] { return receive->toPlainText() == "start红"; }));
+        VERIFY(feed(worker, port, "R\x1b[38;5;196;48;2;10;20;30mI\x1b[39;49m<b>\x1b[92mG\x1b[0mZ") &&
+               until([&] { return receive->toPlainText() == "start红RI<b>GZ"; }));
+        const auto red = formatAt(5).foreground().color();
+        VERIFY(red.red() > red.green() && red.red() > red.blue() && formatAt(6).foreground().color() == red);
+        VERIFY(formatAt(7).foreground().color() == QColor(255, 0, 0) && formatAt(7).background().color() == QColor(10, 20, 30));
+        VERIFY(formatAt(8).foreground().style() == Qt::NoBrush && formatAt(8).background().style() == Qt::NoBrush);
+        VERIFY(formatAt(11).foreground().color().green() > formatAt(11).foreground().color().red());
+        VERIFY(formatAt(12).foreground().style() == Qt::NoBrush);
+
+        clearReceive->click();
+        VERIFY(feed(worker, port, "\x1b[31m" + QByteArray(60000, 'R') + "\x1b[0mZ") &&
+               until([&] { return receive->toPlainText().endsWith('Z'); }));
+        VERIFY(receive->toPlainText().size() == 60000 && formatAt(0).foreground().color() == red &&
+               formatAt(59999).foreground().style() == Qt::NoBrush);
+        clearReceive->click(); hex->click();
+        VERIFY(feed(worker, port, "\x1b[31mR\x1b[0m") && until([&] { return receive->toPlainText() == "1B 5B 33 31 6D 52 1B 5B 30 6D "; }));
+        hex->click();
+        VERIFY(receive->toPlainText() == "R" && formatAt(0).foreground().color() == red);
         host.findChild<QPushButton *>("btnClearReceive")->click(); hex->click();
         VERIFY(feed(worker, port, QByteArray(60000, char(0xAA))) && until([&] { return receive->toPlainText().size() == 60000; }));
         VERIFY(receive->toPlainText() == QString("AA ").repeated(20000));
@@ -1735,6 +1863,7 @@ static int layoutQuickButtonUiTests() {
     return 0;
 }
 #include "plotreadoutuitests.h"
+#include "spectrumlegenduitests.h"
 #include "plotbackgrounduitests.h"
 #include "scopemeasurementuitests.h"
 #include "offlinehistoryuitests.h"
@@ -1754,6 +1883,7 @@ int main(int argc, char **argv) {
     const int font = QFontDatabase::addApplicationFont("C:/Windows/Fonts/msyh.ttc"); if (font >= 0) app.setFont(QFont(QFontDatabase::applicationFontFamilies(font).value(0), 9));
     if (qEnvironmentVariableIsSet("WAVELINK_RANGE_SLIDER_UI_ONLY")) return rangeSliderThemeTests();
     if (qEnvironmentVariableIsSet("WAVELINK_PLOT_READOUT_UI_ONLY")) return plotReadoutUiTests();
+    if (qEnvironmentVariableIsSet("WAVELINK_SPECTRUM_LEGEND_UI_ONLY")) return spectrumLegendUiTests();
     if (qEnvironmentVariableIsSet("WAVELINK_PLOT_BACKGROUND_UI_ONLY")) return plotBackgroundUiTests();
     if (qEnvironmentVariableIsSet("WAVELINK_SCOPE_MEASUREMENT_UI_ONLY")) return scopeMeasurementUiTests();
     if (qEnvironmentVariableIsSet("WAVELINK_OFFLINE_HISTORY_UI_ONLY")) return offlineHistoryUiTests(offscreenMessages);
@@ -1766,7 +1896,7 @@ int main(int argc, char **argv) {
     }
     if (qEnvironmentVariableIsSet("WAVELINK_AUDIT_RELIABILITY_UI_ONLY")) return auditReliabilityUiTests(offscreenMessages);
     if (qEnvironmentVariableIsSet("WAVELINK_TIME_RANGE_UI_ONLY")) return timeRangeSpanTests();
-    if (qEnvironmentVariableIsSet("WAVELINK_INTERFACE_HINTS_UI_ONLY")) return interfaceHintsUiTests();
+    if (qEnvironmentVariableIsSet("WAVELINK_INTERFACE_HINTS_UI_ONLY")) return interfaceHintsUiTests(offscreenMessages);
     if (qEnvironmentVariableIsSet("WAVELINK_BLE_QUICK_UI_ONLY")) return bleQuickUiTests(app.arguments().value(2));
     if (qEnvironmentVariableIsSet("WAVELINK_RECEIVE_CACHE_UI_ONLY")) return receiveCacheUiTests();
     if (qEnvironmentVariableIsSet("WAVELINK_SYSTEM_SETTINGS_UI_ONLY")) return systemSettingsUiTests(offscreenMessages);
@@ -1780,6 +1910,7 @@ int main(int argc, char **argv) {
     QSettings main("WaveLink", "WaveLink"), advanced("WaveLink", "AdvancedApp"); advanced.setValue("InterfaceType", 0); main.setValue("editCacheDir", dir.path()); main.setValue("comboProtocol", 0); main.sync();
     if (qEnvironmentVariableIsSet("WAVELINK_PLOT_UI_ONLY")) return plotInteractionTests();
     if (qEnvironmentVariableIsSet("WAVELINK_FILE_SEND_UI_ONLY")) return fileSendUiTests(dir.path(), offscreenMessages);
+    if (qEnvironmentVariableIsSet("WAVELINK_TCP_SERVER_UI_ONLY")) return networkUiTests(dir.path(), offscreenMessages);
     ProtocolProfile text, binary, variable; VERIFY(ProtocolProfileValidator::profile(ProtocolEditorWidget::example(false), text, error)); VERIFY(ProtocolProfileValidator::profile(ProtocolEditorWidget::example(true), binary, error));
     VERIFY(ProtocolProfileValidator::profile(ProtocolEditorWidget::lengthExample(), variable, error));
     ProtocolProfileStore store; VERIFY(store.load(error)); auto snapshot = store.snapshot(); snapshot.profiles = {text, binary, variable}; snapshot.shared.kind = "custom"; snapshot.shared.id = text.id; VERIFY(store.commit(snapshot, error));

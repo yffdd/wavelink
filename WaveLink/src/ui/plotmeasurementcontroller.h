@@ -25,15 +25,16 @@ public:
     QWidget *panel() const { return m_panel; }
     bool isEnabled() const { return m_enabled; }
     void setEnabled(bool enabled);
-    void appendMenu(QMenu *menu);
+    QMenu *appendMenu(QMenu *menu);
     void setLatestTime(double time) { m_latestTime = time; }
-    void setPreferenceKey(const QString &key);
-    void reloadPreferences() { setPreferenceKey(m_preferenceKey); }
+    void setPreferenceKey(const QString &key, bool rememberVisibility = true);
+    void reloadPreferences() { setPreferenceKey(m_preferenceKey, m_rememberVisibility); }
     void resetData();
     void refresh();
     ScopeMeasurements::Result lastResult() const { return m_result; }
 signals:
     void activated();
+    void visibilityAboutToChange(bool visible);
     void visibilityChanged(bool visible);
     void measurementsUpdated();
 protected:
@@ -78,7 +79,8 @@ private:
     double m_workLower = 0, m_workUpper = 0;
     double m_resultLower = 0, m_resultUpper = 0;
     bool m_enabled = false, m_initialized = false, m_loading = false, m_stampValid = false;
-    int m_selectedChannel = -1, m_drag = -1, m_lastCount = -1, m_originalMinimumHeight = 0;
+    bool m_rememberVisibility = true;
+    int m_selectedChannel = -1, m_drag = -1, m_lastCount = -1;
     quint64 m_version = 0, m_workVersion = 0, m_lastPrefixRevision = 0;
     const QCPGraphDataContainer *m_lastData = nullptr;
     QCPRange m_lastRange;

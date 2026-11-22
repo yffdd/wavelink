@@ -4,6 +4,8 @@
 #include <QThread>
 #include <QNetworkInterface>
 #include <QNetworkProxy>
+#include <QFileInfo>
+#include <QTemporaryDir>
 #include <functional>
 #include <iostream>
 #define VERIFY(c) do { if (!(c)) { std::cerr << "TCP bind failure at " << __LINE__ << ": " #c << "\n"; return 1; } } while (0)
@@ -12,6 +14,142 @@ static bool until(std::function<bool()> condition) {
     while (!condition() && elapsed.elapsed() < 5000) { QCoreApplication::processEvents(); QThread::msleep(1); }
     return condition();
 }
+
+static int testServerRecovery()
+{
+    NetworkHandler server;
+    quint64 sendSession = 0;
+    int connections = 0, failures = 0;
+    QString disconnectReason, waitReason;
+    QObject::connect(&server, &NetworkHandler::clientConnected, [&](const QString &, quint64 session) {
+        sendSession = session;
+        ++connections;
+    });
+    QObject::connect(&server, &NetworkHandler::clientDisconnected, [&](const QString &reason) { disconnectReason = reason; });
+    QObject::connect(&server, &NetworkHandler::tcpServerWaitChanged, [&](const QString &reason) { waitReason = reason; });
+    QObject::connect(&server, &NetworkHandler::errorOccurred, [&](const QString &) { ++failures; });
+    server.setProtocol(1);
+    VERIFY(server.startConnection(2, "127.0.0.1", 0));
+    auto listener = server.findChild<QTcpServer *>();
+    VERIFY(listener);
+    const quint16 port = listener->serverPort();
+
+    QTcpSocket first;
+    first.connectToHost(QHostAddress::LocalHost, port);
+    VERIFY(until([&] { return connections == 1 && server.sendReady(); }));
+    const auto oldSession = sendSession;
+    QTemporaryDir directory;
+    VERIFY(directory.isValid());
+    const auto path = directory.filePath("across-reconnect.wlr");
+    server.startRecording(path, 250);
+    const QByteArray partial = "1,2\n99,";
+    VERIFY(first.write(partial) == partial.size());
+    VERIFY(until([&] { return server.getRxCount() == partial.size(); }));
+    quint64 dropped = 0;
+    VERIFY(server.takePlotFrames(10, dropped) == QVector<QVector<double>>({{1, 2}}));
+    auto accepted = listener->findChild<QTcpSocket *>();
+    VERIFY(accepted && accepted->socketOption(QAbstractSocket::KeepAliveOption).toBool());
+    VERIFY(server.enqueueData("old queued data", oldSession));
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    accepted->errorOccurred(QAbstractSocket::NetworkError);
+#else
+    accepted->error(QAbstractSocket::NetworkError);
+#endif
+    VERIFY(!server.sendReady() && server.pendingSendBytes() == 0 && listener->isListening());
+    VERIFY(!disconnectReason.isEmpty() && failures == 0);
+    VERIFY(QFileInfo::exists(path + ".part") && !QFileInfo::exists(path));
+
+    QTcpSocket second;
+    second.connectToHost(QHostAddress::LocalHost, port);
+    VERIFY(until([&] { return connections == 2 && server.sendReady(); }));
+    VERIFY(sendSession != oldSession && !server.enqueueData("old session", oldSession));
+    VERIFY(server.enqueueData("new session", sendSession));
+    VERIFY(until([&] { return second.bytesAvailable() == 11; }));
+    VERIFY(second.readAll() == "new session");
+    VERIFY(second.write("3,4\n") == 4 && until([&] { return server.getRxCount() == partial.size() + 4; }));
+    VERIFY(server.takePlotFrames(10, dropped) == QVector<QVector<double>>({{3, 4}}));
+    second.disconnectFromHost();
+    VERIFY(until([&] { return !server.sendReady(); }));
+    VERIFY(QFileInfo::exists(path + ".part") && !QFileInfo::exists(path));
+    VERIFY(server.finishRecording().isEmpty()); // Manual stop also works while waiting.
+    QVector<QVector<double>> recorded;
+    QString recordingError;
+    VERIFY(WlrRecordingWriter::visitFiles({path}, [&](qint64, const QVector<double> &values, qint64) {
+        recorded.append(values);
+        return true;
+    }, recordingError));
+    VERIFY(recorded == QVector<QVector<double>>({{1, 2}, {3, 4}}));
+
+    listener->pauseAccepting();
+    listener->acceptError(QAbstractSocket::NetworkError);
+    VERIFY(QMetaObject::invokeMethod(&server, "refreshTcpServer", Qt::DirectConnection,
+        Q_ARG(QList<QHostAddress>, QList<QHostAddress>())));
+    QTcpSocket third;
+    third.connectToHost(QHostAddress::LocalHost, port);
+    VERIFY(until([&] { return connections == 3 && server.sendReady(); }));
+    third.disconnectFromHost();
+    VERIFY(until([&] { return !server.sendReady(); }));
+
+    listener->close();
+    QTcpServer blocker;
+    VERIFY(blocker.listen(QHostAddress::LocalHost, port));
+    VERIFY(until([&] { return !waitReason.isEmpty(); }));
+    VERIFY(!listener->isListening() && failures == 0);
+    blocker.close();
+    VERIFY(until([&] { return listener->isListening() && waitReason.isEmpty(); }));
+    VERIFY(listener->serverPort() == port);
+    server.stopConnection();
+    VERIFY(QMetaObject::invokeMethod(&server, "refreshTcpServer", Qt::DirectConnection,
+        Q_ARG(QList<QHostAddress>, QList<QHostAddress>())));
+    VERIFY(!listener->isListening());
+    return 0;
+}
+
+static int testLocalAddressLoss()
+{
+    QHostAddress local;
+    for (const auto &iface : QNetworkInterface::allInterfaces()) {
+        if (!iface.flags().testFlag(QNetworkInterface::IsRunning)) continue;
+        for (const auto &entry : iface.addressEntries()) {
+            if (entry.ip().protocol() == QAbstractSocket::IPv4Protocol && !entry.ip().isLoopback()) {
+                local = entry.ip();
+                break;
+            }
+        }
+        if (!local.isNull()) break;
+    }
+    if (local.isNull()) {
+        std::cout << "No active non-loopback IPv4 address; skipping address loss simulation.\n";
+        return 0;
+    }
+
+    for (const bool wildcard : {false, true}) {
+        NetworkHandler server;
+        QString waitReason;
+        QObject::connect(&server, &NetworkHandler::tcpServerWaitChanged, [&](const QString &reason) { waitReason = reason; });
+        VERIFY(server.startConnection(2, wildcard ? QStringLiteral("0.0.0.0") : local.toString(), 0));
+        const auto listener = server.findChild<QTcpServer *>();
+        VERIFY(listener);
+        const auto port = listener->serverPort();
+        QTcpSocket peer;
+        peer.setProxy(QNetworkProxy::NoProxy);
+        peer.connectToHost(local, port);
+        VERIFY(until([&] { return server.sendReady(); }));
+        VERIFY(QMetaObject::invokeMethod(&server, "refreshTcpServer", Qt::DirectConnection,
+            Q_ARG(QList<QHostAddress>, QList<QHostAddress>())));
+        VERIFY(!server.sendReady() && listener->isListening() == wildcard && waitReason.isEmpty() == wildcard);
+        VERIFY(QMetaObject::invokeMethod(&server, "refreshTcpServer", Qt::DirectConnection,
+            Q_ARG(QList<QHostAddress>, QList<QHostAddress>{local})));
+        VERIFY(listener->isListening() && listener->serverPort() == port && waitReason.isEmpty());
+        QTcpSocket reconnected;
+        reconnected.setProxy(QNetworkProxy::NoProxy);
+        reconnected.connectToHost(local, port);
+        VERIFY(until([&] { return server.sendReady(); }));
+        server.stopConnection();
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     struct RestoreProxy { QNetworkProxy old = QNetworkProxy::applicationProxy(); ~RestoreProxy() { QNetworkProxy::setApplicationProxy(old); } } restore;
@@ -82,6 +220,8 @@ int main(int argc, char **argv) {
             auto peer = ipv6.nextPendingConnection(); VERIFY(peer->peerAddress() == QHostAddress::LocalHostIPv6); v6.stopConnection();
         }
     }
-    std::cout << "TCP listener address, explicit/automatic client binding, source ports, validation, conflicts, cleanup and IPv6 passed (loopback only).\n";
+    VERIFY(testServerRecovery() == 0);
+    VERIFY(testLocalAddressLoss() == 0);
+    std::cout << "TCP binding, IPv6, peer recovery, listen retry, continuous recording and send-session isolation passed.\n";
     return 0;
 }

@@ -268,7 +268,8 @@ void MainWindow::saveConfig()
         const auto selection = m_protocolStore->snapshot().shared;
         settings.setValue("comboProtocol", selection.kind == "custom" ? 4 : selection.legacyIndex());
     }
-    settings.setValue("comboBaudRate", comboBaudRate->currentIndex());
+    const QVariant baudRateId = comboBaudRate->currentData();
+    settings.setValue("comboBaudRate", baudRateId.isValid() ? baudRateId.toInt() : -1);
     settings.setValue("comboDataBits", comboDataBits->currentIndex());
     settings.setValue("comboParity", comboParity->currentIndex());
     settings.setValue("comboStopBits", comboStopBits->currentIndex());
@@ -285,6 +286,7 @@ void MainWindow::saveConfig()
     
     // Console Dock
     settings.setValue("chkShowReceiveData", chkShowReceiveData->isChecked());
+    settings.setValue("chkShowTransmitData", chkShowTransmitData->isChecked());
     settings.setValue("chkHexReceive", chkHexReceive->isChecked());
     settings.setValue("comboEncoding", comboEncoding->currentIndex());
     settings.setValue("comboAppendNewline", comboAppendNewline->currentIndex());
@@ -329,6 +331,7 @@ void MainWindow::loadConfig()
     // Theme
     m_mainPlotBackground = QColor(settings.value("PlotBackground/Main").toString());
     m_detachedPlotBackground = QColor(settings.value("PlotBackground/Detached").toString());
+    setDetachedWaveformHeight(settings.value("Plot/DetachedWaveformHeight", 0).toInt());
     int themeIdx = settings.value("comboTheme", 0).toInt();
     if (themeIdx >= 0 && themeIdx < comboTheme->count()) {
         comboTheme->setCurrentIndex(themeIdx);
@@ -382,6 +385,7 @@ void MainWindow::loadConfig()
             if (!innerWinState.isEmpty() && innerMainWindow) {
                 innerMainWindow->restoreState(innerWinState);
             }
+            if (hasActivePlotMeasurements() || m_detachedWaveformHeight > 0) equalizePlotHeights();
             if (consoleSplitter && !m_normalConsoleSplitterState.isEmpty()) {
                 consoleSplitter->restoreState(m_normalConsoleSplitterState);
             }
@@ -414,7 +418,7 @@ void MainWindow::loadConfig()
         QMetaObject::invokeMethod(comboServerIP, "currentTextChanged", Q_ARG(QString, comboServerIP->currentText()));
     }
     if (!m_protocolInitialized) { const QSignalBlocker blocker(comboProtocol); comboProtocol->setCurrentIndex(qBound(0, settings.value("comboProtocol", 1).toInt(), 3)); }
-    comboBaudRate->setCurrentIndex(settings.value("comboBaudRate", 4).toInt()); // 115200 default
+    comboBaudRate->setCurrentIndex(comboBaudRate->findData(settings.value("comboBaudRate", 4).toInt())); // 115200 default
     comboDataBits->setCurrentIndex(settings.value("comboDataBits", 3).toInt());
     comboParity->setCurrentIndex(settings.value("comboParity", 0).toInt());
     comboStopBits->setCurrentIndex(settings.value("comboStopBits", 0).toInt());
@@ -442,6 +446,7 @@ void MainWindow::loadConfig()
     
     // Console Dock
     chkShowReceiveData->setChecked(settings.value("chkShowReceiveData", true).toBool());
+    chkShowTransmitData->setChecked(settings.value("chkShowTransmitData", false).toBool());
     chkHexReceive->setChecked(settings.value("chkHexReceive", false).toBool());
     comboEncoding->setCurrentIndex(settings.value("comboEncoding", 0).toInt());
     comboAppendNewline->setCurrentIndex(settings.value("comboAppendNewline", 1).toInt());

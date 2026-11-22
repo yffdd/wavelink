@@ -18,7 +18,11 @@
 
 主程序保持 Qt 5.14.2 / MinGW；Windows BLE 辅助程序使用本机 Visual Studio 2022 C++ 工具与 Windows 10/11 SDK 单独编译。首次调试运行 `Build_BLE_Host.bat Debug`，再重新配置 Qt 工程；默认会从根目录 `build/ble-helper-msvc-debug/Debug` 将 `WaveLinkBleHost.exe` 复制到主程序目录。也可将目标目录作为第二个参数传入脚本。
 
-两套发布脚本顶部新增 `ENABLE_BLE=1`，发布时自动构建 Release 辅助程序并复制到发布文件夹。设为 `0` 可发布不含 BLE 接口的版本。辅助程序使用静态 MSVC 运行库，用户电脑无需安装 Qt 或 MSVC 开发工具；构建电脑需具备相应工具。
+发布脚本顶部的 `ENABLE_BLE=1` 会将 Release 辅助程序复制到发布文件夹。具备 Visual Studio 2022 C++ 工具时重新编译，并在 `deploy/.ble-cache/Release` 保存辅助程序及源码、文件校验值；缺少编译工具时，仅在源码与校验值均一致的情况下复用该缓存。修改计算器等主程序资源不影响 BLE 缓存；BLE 源码改变后会要求重新编译，避免打包旧辅助程序。缓存位于安装版清理目录之外，并已加入 Git 忽略。
+
+安装版会在清理工作目录前检查 BLE 构建条件。没有编译工具且没有匹配缓存时，会明确提示安装 Visual Studio 2022 的「使用 C++ 的桌面开发」及 Windows 10/11 SDK。也可由开发者显式导入对应版本的可信辅助程序，例如 `powershell -NoProfile -ExecutionPolicy Bypass -File deploy/Build-BleHost.ps1 -Configuration Release -ImportPrebuilt "C:\Program Files (x86)\WaveLink\WaveLinkBleHost.exe" -SourceCommit v0.15`。导入前须确认它来自对应版本；脚本会核对当前 BLE 源码与该标签一致，并检查 x64 格式和通信握手，之后保存校验值。自动复用不会直接从任意安装目录查找 EXE。
+
+设为 `ENABLE_BLE=0` 可发布不含 BLE 接口的版本。辅助程序使用静态 MSVC 运行库，用户电脑无需安装 Qt 或 MSVC 开发工具。
 
 `Build_BLE_Host.bat` 的第三个参数可指定独立构建目录，第二个参数仍是可选的复制目标目录。两套发布脚本均传入自己的 BLE 构建目录；只有单独执行且不传第三个参数时，才使用上述根目录的调试/辅助构建目录。
 

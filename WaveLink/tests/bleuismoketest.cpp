@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include <QTreeWidget>
 #include "thememanager.h"
 #include "testregistrysandbox.h"
 #include "fakeserialbackend.h"
@@ -374,6 +375,7 @@ int main(int argc, char **argv)
     bool customTemplateSafe = false, invalidWriteBlocked = false, checkDuplicate = false, duplicateSafe = false;
     bool reconnectConfirmed = false;
     int configurationDialogs = 0;
+    bool saveDiscoveredForLater = true;
     bool gattControlsVisible = false;
     bool advancedVisible = false, advancedConfirmation = false, cancelAdvanced = false, advancedCancelled = false, advancedClickScheduled = false;
     int sendStoppedShown = 0; bool sendStoppedCopyable = false;
@@ -385,6 +387,10 @@ int main(int argc, char **argv)
         QScopedValueRollback<bool> automationGuard(automationBusy, true);
         auto dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
         if (!dialog) return;
+        if (dialog->windowTitle() == QStringLiteral("确认 BLE 透传通道")) {
+            if (auto yes = dialog->findChild<QPushButton *>("bleConfirmYes")) yes->click();
+            return;
+        }
         if (dialog->windowTitle() == QStringLiteral("重新连接并核对配置？")) {
             if (auto yes = dialog->findChild<QPushButton *>("bleConfirmYes")) { reconnectConfirmed = true; yes->click(); }
             return;
@@ -397,7 +403,7 @@ int main(int argc, char **argv)
             else if (yes) yes->click();
             return;
         }
-        if (dialog->windowTitle() == QStringLiteral("BLE 收发配置与模板")) {
+        if (dialog->objectName() == "bleConfigurationDialog" && !dialog->findChild<QPushButton *>("bleApplyConfiguration")) {
             auto summary = dialog->findChild<QPlainTextEdit *>("bleProfileSummary");
             auto field = dialog->findChild<QLineEdit *>("bleNextRxUuid");
             auto save = dialog->findChild<QPushButton *>("bleSaveNextProfile");
@@ -414,6 +420,7 @@ int main(int argc, char **argv)
             if (profileAction == 5 || profileAction == 6 || profileAction == 7) {
                 if (profileAction == 7 && advancedCancelled) { dialog->reject(); return; }
                 if (!advancedClickScheduled && packet && interval && toggle && live && live->isEnabled()) {
+                    dialog->findChild<QToolButton *>("bleGattAdvancedToggle")->setChecked(true);
                     toggle->setChecked(true); packet->setValue(profileAction == 5 ? 20 : 244); interval->setValue(profileAction == 5 ? 40 : 0);
                     if (auto scroll = dialog->findChild<QScrollArea *>()) scroll->ensureWidgetVisible(live);
                     advancedVisible = packet->isVisible() && interval->isVisible() && packet->minimum() == 1 && packet->maximum() == 512 && interval->minimum() == 0 && interval->maximum() == 1000;
@@ -430,6 +437,8 @@ int main(int argc, char **argv)
             }
             if (profileAction == 1 && field && save) { field->setText("FFE2"); save->click(); return; }
             if (profileAction == 4) {
+                field->setText("FFE1");
+                if (auto stream = dialog->findChild<QCheckBox *>("bleStreamConfirmation")) stream->setChecked(true);
                 for (auto button : dialog->findChildren<QPushButton *>()) if (button->text() == QStringLiteral("保存并重新连接…")) { QTimer::singleShot(0, button, &QPushButton::click); return; }
             }
             if (profileAction == 2) readOnlyCorrect = field && field->isReadOnly() && save && !save->isEnabled() && packet && !packet->isEnabled() && interval && !interval->isEnabled() && live && !live->isEnabled();
@@ -471,7 +480,7 @@ int main(int argc, char **argv)
             table->selectRow(0);
             dialog->grab().save(QDir(QCoreApplication::applicationDirPath()).filePath("ble-scan-dark.png"));
             for (auto button : dialog->findChildren<QPushButton *>()) if (button->text() == QStringLiteral("选择设备") && button->isEnabled()) { button->click(); return; }
-        } else if (dialog->windowTitle() == QStringLiteral("BLE 快速收发配置")) {
+        } else if (dialog->objectName() == "bleConfigurationDialog" && dialog->findChild<QPushButton *>("bleApplyConfiguration")) {
             auto rx = dialog->findChild<QComboBox *>("bleReceiveCharacteristic");
             auto tx = dialog->findChild<QComboBox *>("bleTransmitCharacteristic");
             auto stream = dialog->findChild<QCheckBox *>("bleStreamConfirmation");
@@ -491,7 +500,8 @@ int main(int argc, char **argv)
             rx->setCurrentIndex(1); tx->setCurrentIndex(1); stream->setChecked(true);
             auto mode = dialog->findChild<QComboBox *>("bleWriteMode");
             mode->setCurrentIndex(1);
-            for (auto button : dialog->findChildren<QPushButton *>()) if (button->text() == QStringLiteral("应用并开始调试")) invalidWriteBlocked = !button->isEnabled();
+            auto apply = dialog->findChild<QPushButton *>("bleApplyConfiguration");
+            invalidWriteBlocked = apply && !apply->isEnabled();
             mode->setCurrentIndex(0);
             gattControlsVisible = rx->isVisible() && tx->isVisible() && mode->isVisible() && stream->isVisible();
             if (auto scroll = dialog->findChild<QScrollArea *>("bleGattScroll")) scroll->ensureWidgetVisible(stream);
@@ -502,7 +512,8 @@ int main(int argc, char **argv)
                 dialog->grab().save(QDir(QCoreApplication::applicationDirPath()).filePath("ble-config-light.png"));
                 ThemeManager::applyTheme(&app, ThemeManager::DarkTheme);
             }
-            for (auto button : dialog->findChildren<QPushButton *>()) if (button->text() == QStringLiteral("应用并开始调试") && button->isEnabled()) { button->click(); return; }
+            auto action = saveDiscoveredForLater ? dialog->findChild<QPushButton *>("bleSaveNextProfile") : apply;
+            if (action && action->isEnabled()) action->click();
         }
     });
     automation.start();
@@ -511,30 +522,81 @@ int main(int argc, char **argv)
     QObject::connect(&safety, &QTimer::timeout, [&] { if (auto dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) dialog->reject(); });
     safety.start(30000); // Extended scenarios include several explicit confirmation dialogs.
     scan->click();
-    open->click();
     auto client = window.findChild<BleHostClient *>(); VERIFY(client);
+    auto profilesButton = window.findChild<QPushButton *>("bleProfilesButton");
+    auto diagnosticButton = window.findChild<QPushButton *>("bleDiagnosticsButton");
+    auto bleStatus = window.findChild<QLabel *>("bleConnectionStatus");
+    VERIFY(profilesButton && diagnosticButton && bleStatus);
+    open->click();
+    VERIFY(until([&] { return client->state() == BleHostClient::State::Idle && bleStatus->text().contains(QStringLiteral("收发配置")); }));
+    VERIFY(configurationDialogs == 0);
+    profilesButton->click();
+    VERIFY(until([&] { return client->state() == BleHostClient::State::Idle && bleStatus->text().contains(QStringLiteral("配置已保存")); }));
+    VERIFY(configurationDialogs == 1 && client->txCount() == 0);
+    open->click();
     VERIFY(until([&] { return client->state() == BleHostClient::State::Ready; }));
+    VERIFY(configurationDialogs == 1);
     VERIFY(open->text() == QStringLiteral("断开 BLE 连接") && !interfaces->isEnabled());
     VERIFY(!record->isEnabled() && file->isEnabled());
     VERIFY(templateSafe && customTemplateSafe && invalidWriteBlocked && gattControlsVisible);
+    const auto inlineTree = [&]() -> QTreeWidget * {
+        for (auto tree : window.findChildren<QTreeWidget *>("bleInlineGattTree"))
+            if (tree->isVisible()) return tree;
+        return nullptr;
+    };
+    const auto inlineButton = [&](const QString &name) { return inlineTree()->findChild<QToolButton *>(name); };
+    const auto compactRowFits = [](QTreeWidget *tree, QToolButton *button) {
+        if (!tree || !button) return false;
+        const auto cell = button->parentWidget();
+        const auto caption = cell ? cell->findChild<QLabel *>("bleInlineCharacteristicName") : nullptr;
+        if (!caption) return false;
+        const QRect actionBounds(button->mapTo(tree->viewport(), QPoint()), button->size());
+        const QRect captionBounds(caption->mapTo(tree->viewport(), QPoint()), caption->size());
+        const auto item = tree->itemAt(captionBounds.topLeft());
+        return item && tree->itemWidget(item, 0) == cell && item->text(0).isEmpty() &&
+            item->data(0, Qt::AccessibleTextRole).toString() == caption->text() &&
+            captionBounds.bottom() < actionBounds.top() && tree->viewport()->rect().contains(actionBounds);
+    };
+    const auto applyChannels = window.findChild<QPushButton *>("bleInlineApplyChannels");
+    VERIFY(inlineTree() && inlineTree()->isVisible() && applyChannels && applyChannels->isHidden());
+    VERIFY(inlineButton("bleGattRx")->isChecked() && inlineButton("bleGattTx")->isChecked());
+    for (const QString &name : {QString("bleGattRx"), QString("bleGattTx"), QString("bleGattRead")}) {
+        VERIFY(compactRowFits(inlineTree(), inlineButton(name)));
+    }
+    inlineButton("bleGattRead")->click();
+    VERIFY(until([&] {
+        auto result = inlineTree()->parentWidget()->findChild<QPlainTextEdit *>("bleGattReadResult");
+        return result && result->toPlainText().contains("68 69") && !client->readPending();
+    }));
+    inlineButton("bleGattTx")->click();
+    VERIFY(applyChannels->isVisible() && applyChannels->isEnabled() && client->canSend());
+    applyChannels->click();
+    VERIFY(until([&] { return client->state() == BleHostClient::State::Ready && !client->canSend() && inlineTree(); }));
+    VERIFY(configurationDialogs == 1 && !inlineButton("bleGattTx")->isChecked() && applyChannels->isHidden());
+    inlineButton("bleGattTx")->click();
+    VERIFY(applyChannels->isVisible() && applyChannels->isEnabled());
+    applyChannels->click();
+    VERIFY(until([&] { return client->state() == BleHostClient::State::Ready && client->canSend() && inlineTree(); }));
+    VERIFY(configurationDialogs == 1 && inlineButton("bleGattTx")->isChecked() && applyChannels->isHidden());
     // Successful local configuration + unchanged discovery bypasses the UI,
     // but still awaits the helper's real subscription acknowledgement.
     const int beforeShortcut = configurationDialogs;
     open->click(); VERIFY(until([&] { return client->state() == BleHostClient::State::Idle && open->isEnabled(); }));
+    VERIFY(!inlineTree());
     open->click(); VERIFY(until([&] { return client->state() == BleHostClient::State::Ready; }));
     VERIFY(configurationDialogs == beforeShortcut && client->txCount() == 0 && !client->sendBusy());
-    auto profilesButton = window.findChild<QPushButton *>("bleProfilesButton");
-    auto diagnosticButton = window.findChild<QPushButton *>("bleDiagnosticsButton");
-    VERIFY(profilesButton && diagnosticButton);
     profilesButton->click(); VERIFY(summaryCorrect && client->state() == BleHostClient::State::Ready);
     diagnosticButton->click(); VERIFY(diagnosticsCorrect && client->state() == BleHostClient::State::Ready);
+    profileAction = 5; advancedClickScheduled = false; profilesButton->click(); profileAction = 0;
+    VERIFY(advancedVisible && client->sendSettings()["intervalMs"] == 40 && client->sendSettings()["effectivePacket"] == 20);
+    { QSettings saved("WaveLink", "WaveLink"); BleProfileStore store(saved); QString error;
+      const auto device = QJsonDocument::fromJson(saved.value("Ble/LastDevice").toByteArray()).object();
+      VERIFY(store.deviceProfile(device, error).contains("_validatedGatt")); }
     profileAction = 1; profilesButton->click(); profileAction = 0;
     VERIFY(client->state() == BleHostClient::State::Ready); // Next config must NOT hot-replace GATT.
     { QSettings saved("WaveLink", "WaveLink"); BleProfileStore store(saved); QString error;
       const auto device = QJsonDocument::fromJson(saved.value("Ble/LastDevice").toByteArray()).object();
       VERIFY(store.deviceProfile(device, error).value("rxUuid").toString() == BleProfileStore::normalizeUuid("FFE2")); }
-    profileAction = 5; advancedClickScheduled = false; profilesButton->click(); profileAction = 0;
-    VERIFY(advancedVisible && client->sendSettings()["intervalMs"] == 40 && client->sendSettings()["effectivePacket"] == 20);
     profileAction = 7; cancelAdvanced = true; advancedClickScheduled = false; profilesButton->click(); profileAction = 0; cancelAdvanced = false;
     VERIFY(advancedConfirmation && advancedCancelled && client->sendSettings()["intervalMs"] == 40);
     profileAction = 6; advancedClickScheduled = false; profilesButton->click(); profileAction = 0;
@@ -640,14 +702,37 @@ int main(int argc, char **argv)
     ThemeManager::applyTheme(&app, ThemeManager::LightTheme); restored.resize(750, 1400); restored.show(); app.processEvents();
     ThemeManager::applyTheme(&app, ThemeManager::DarkTheme); restored.resize(1200, 800); app.processEvents();
     restored.close();
+    config.setValue("Ble/LastDevice", QJsonDocument(QJsonObject{{"name", "Fake Nordic UART"}, {"address", "17"}, {"addressType", 0}}).toJson());
+    {
+        MainWindow nordic; nordic.show(); app.processEvents();
+        auto nordicInterface = nordic.findChild<QComboBox *>("comboInterface");
+        nordicInterface->setCurrentIndex(nordicInterface->findData(4));
+        auto connectButton = nordic.findChild<QPushButton *>("btnOpenClose");
+        auto nordicClient = nordic.findChild<BleHostClient *>();
+        const int beforeNordic = configurationDialogs;
+        VERIFY(until([&] { return connectButton->isEnabled(); }));
+        connectButton->click();
+        VERIFY(until([&] { return nordicClient->state() == BleHostClient::State::Ready; }));
+        VERIFY(configurationDialogs == beforeNordic && nordicClient->canReceive() && nordicClient->canSend() && nordicClient->txCount() == 0);
+        auto nordicTree = nordic.findChild<QTreeWidget *>("bleInlineGattTree");
+        VERIFY(nordicTree);
+        nordicTree->parentWidget()->setMaximumWidth(245);
+        QApplication::processEvents();
+        VERIFY(compactRowFits(nordicTree, nordicTree->findChild<QToolButton *>("bleGattTx")));
+        nordicTree->grab().save(QDir(QCoreApplication::applicationDirPath()).filePath("ble-inline-nordic.png"));
+        auto profile = BleProfileStore(config).deviceProfile({{"address", "17"}, {"addressType", 0}}, profileError);
+        VERIFY(profile.value("withoutResponse").toBool() && profile.value("stream").toBool() && profile.contains("_validatedGatt"));
+        nordic.close();
+    }
     config.setValue("Ble/LastDevice", QJsonDocument(QJsonObject{{"name", "Fake BLE"}, {"address", "7"}, {"addressType", 0}}).toJson());
     VERIFY(BleProfileStore(config).saveDeviceProfile({{"address", "7"}, {"addressType", 0}}, fakeProfile, profileError));
     checkDuplicate = true;
+    saveDiscoveredForLater = false;
     MainWindow closing; closing.show(); app.processEvents();
     auto closingInterface = closing.findChild<QComboBox *>("comboInterface"); closingInterface->setCurrentIndex(closingInterface->findData(4));
     closing.findChild<QLineEdit *>("editCacheDir")->setText(settingsDirectory.path());
     VERIFY(until([&] { return closing.findChild<QPushButton *>("btnOpenClose")->isEnabled(); }));
-    closing.findChild<QPushButton *>("btnOpenClose")->click();
+    closing.findChild<QPushButton *>("bleProfilesButton")->click();
     auto closingClient = closing.findChild<BleHostClient *>();
     VERIFY(until([&] { return closingClient->state() == BleHostClient::State::Ready; }));
     VERIFY(duplicateSafe); // Duplicate UUIDs must never silently select one handle.
@@ -666,7 +751,7 @@ int main(int argc, char **argv)
     MainWindow capabilityWindow; capabilityWindow.show(); app.processEvents();
     auto capabilityInterface = capabilityWindow.findChild<QComboBox *>("comboInterface"); capabilityInterface->setCurrentIndex(capabilityInterface->findData(4));
     VERIFY(until([&] { return capabilityWindow.findChild<QPushButton *>("btnOpenClose")->isEnabled(); }));
-    capabilityWindow.findChild<QPushButton *>("btnOpenClose")->click();
+    capabilityWindow.findChild<QPushButton *>("bleProfilesButton")->click();
     auto capabilityClient = capabilityWindow.findChild<BleHostClient *>();
     VERIFY(until([&] { return capabilityClient->state() == BleHostClient::State::Ready; }));
     profileAction = 6; advancedClickScheduled = false; capabilityWindow.findChild<QPushButton *>("bleProfilesButton")->click(); profileAction = 0;

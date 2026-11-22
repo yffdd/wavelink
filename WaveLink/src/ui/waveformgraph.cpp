@@ -13,6 +13,16 @@ int blockCapacity(int count) {
 WaveformGraph::Summary WaveformGraph::sample(const QCPGraphDataContainer &data, int index) const {
     return std::isfinite(data.at(index)->value) ? Summary{index, index, 0} : Summary{-1, -1, 1};
 }
+
+double WaveformGraph::nearestSampleTime(double time) const
+{
+    QVector<QCPGraphData> points;
+    QString error;
+    if (!nearbySamples(time, points, error) || points.isEmpty()) return time;
+    return std::min_element(points.cbegin(), points.cend(), [time](const QCPGraphData &a, const QCPGraphData &b) {
+        return std::abs(a.key - time) < std::abs(b.key - time);
+    })->key;
+}
 WaveformGraph::Summary WaveformGraph::combine(const QCPGraphDataContainer &data, const Summary &a, const Summary &b) {
     Summary out = a; out.invalid += b.invalid;
     if (b.minimum >= 0 && (out.minimum < 0 || data.at(b.minimum)->value < data.at(out.minimum)->value)) out.minimum = b.minimum;

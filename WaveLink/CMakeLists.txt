@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.14)
 
 # Normal builds use the version below. Release scripts may provide
 # -DWAVELINK_VERSION_OVERRIDE=x.y.z for a one-off manually versioned build.
-set(WAVELINK_DEFAULT_VERSION 0.14)
+set(WAVELINK_DEFAULT_VERSION 0.15)
 set(WAVELINK_VERSION_OVERRIDE "" CACHE STRING "Optional WaveLink version override")
 if(WAVELINK_VERSION_OVERRIDE)
     project(WaveLink VERSION "${WAVELINK_VERSION_OVERRIDE}" LANGUAGES CXX)
@@ -38,6 +38,10 @@ if(MSVC)
 endif()
 # Find Qt 5
 find_package(Qt5 COMPONENTS Core Gui Widgets SerialPort Network PrintSupport OpenGL Concurrent REQUIRED)
+set(WAVELINK_NETWORK_LIBRARIES Qt5::Network)
+if(WIN32)
+    list(APPEND WAVELINK_NETWORK_LIBRARIES ws2_32)
+endif()
 option(WAVELINK_ENABLE_BLE "Enable the Windows BLE interface" ON)
 
 set(WAVELINK_RESOURCE_FILES resources/resources.qrc)
@@ -221,6 +225,8 @@ add_executable(WaveLink WIN32
     src/ui/waveformgraph.h
     src/ui/plotmeasurementcontroller.cpp
     src/ui/plotmeasurementcontroller.h
+    src/ui/globaltimemeasurement.cpp
+    src/ui/globaltimemeasurement.h
     src/ui/rangeslider.h
     src/ui/plotscrollarea.h
     src/dsp/ffthelper.h
@@ -243,7 +249,7 @@ target_link_libraries(WaveLink PRIVATE
     Qt5::Gui
     Qt5::Widgets
     Qt5::SerialPort
-    Qt5::Network
+    ${WAVELINK_NETWORK_LIBRARIES}
     Qt5::PrintSupport
     Qt5::OpenGL
     Qt5::Concurrent
@@ -389,7 +395,7 @@ if(WAVELINK_BUILD_PROTOCOL_TESTS)
         src/hardware/networkhandler.cpp src/hardware/networkhandler.h
         src/hardware/ble/blestreamworker.cpp src/hardware/ble/blestreamworker.h
         src/hardware/csvrecordingwriter.cpp src/hardware/wlrrecordingwriter.cpp)
-    target_link_libraries(WaveLinkProtocolLiveTest PRIVATE WaveLinkProtocols Qt5::SerialPort Qt5::Network advapi32)
+    target_link_libraries(WaveLinkProtocolLiveTest PRIVATE WaveLinkProtocols Qt5::SerialPort ${WAVELINK_NETWORK_LIBRARIES} advapi32)
     target_compile_definitions(WaveLinkProtocolLiveTest PRIVATE WAVELINK_PROTOCOL_EXAMPLE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/protocolfixtures")
     add_test(NAME WaveLinkProtocolLive COMMAND WaveLinkProtocolLiveTest)
     add_test(NAME WaveLinkAuditReliabilityUi COMMAND WaveLinkProtocolLiveUiTest)
@@ -405,6 +411,12 @@ if(WAVELINK_BUILD_PROTOCOL_TESTS)
     target_compile_definitions(WaveLinkProtocolLiveUiTest PRIVATE QCUSTOMPLOT_USE_OPENGL WAVELINK_ENABLE_BLE=1 WAVELINK_VERSION="${PROJECT_VERSION}")
     set_target_properties(WaveLinkProtocolLiveUiTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/protocol-ui-test")
     add_test(NAME WaveLinkProtocolLiveUi COMMAND WaveLinkProtocolLiveUiTest)
+    add_test(NAME WaveLinkTcpServerUi COMMAND WaveLinkProtocolLiveUiTest)
+    set_tests_properties(WaveLinkTcpServerUi PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;WAVELINK_TCP_SERVER_UI_ONLY=1" TIMEOUT 45)
+    add_test(NAME WaveLinkSpectrumLegendUi COMMAND WaveLinkProtocolLiveUiTest "${CMAKE_CURRENT_BINARY_DIR}/artifacts/spectrum-legend")
+    add_test(NAME WaveLinkSpectrumLegendUiHiDpi COMMAND WaveLinkProtocolLiveUiTest "${CMAKE_CURRENT_BINARY_DIR}/artifacts/spectrum-legend-hidpi")
+    set_tests_properties(WaveLinkSpectrumLegendUi PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;WAVELINK_SPECTRUM_LEGEND_UI_ONLY=1" TIMEOUT 45)
+    set_tests_properties(WaveLinkSpectrumLegendUiHiDpi PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_SCALE_FACTOR=1.5;WAVELINK_SPECTRUM_LEGEND_UI_ONLY=1" TIMEOUT 45)
     add_test(NAME WaveLinkScopeMeasurementUi COMMAND WaveLinkProtocolLiveUiTest "${CMAKE_CURRENT_BINARY_DIR}/artifacts/scope")
     add_test(NAME WaveLinkScopeMeasurementUiHiDpi COMMAND WaveLinkProtocolLiveUiTest "${CMAKE_CURRENT_BINARY_DIR}/artifacts/scope-hidpi")
     set_tests_properties(WaveLinkScopeMeasurementUi PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;WAVELINK_SCOPE_MEASUREMENT_UI_ONLY=1" TIMEOUT 45)
@@ -581,7 +593,7 @@ if(WAVELINK_BUILD_INTERNAL_TESTS)
     add_executable(WaveLinkStatusTextTest tests/statustexttest.cpp
         src/hardware/serialhandler.cpp src/hardware/networkhandler.cpp src/hardware/ble/blestreamworker.cpp
         src/hardware/csvrecordingwriter.cpp src/hardware/wlrrecordingwriter.cpp)
-    target_link_libraries(WaveLinkStatusTextTest PRIVATE WaveLinkProtocols Qt5::SerialPort Qt5::Network)
+    target_link_libraries(WaveLinkStatusTextTest PRIVATE WaveLinkProtocols Qt5::SerialPort ${WAVELINK_NETWORK_LIBRARIES})
     add_test(NAME WaveLinkStatusText COMMAND WaveLinkStatusTextTest)
     set_tests_properties(WaveLinkStatusText PROPERTIES TIMEOUT 45)
     add_executable(WaveLinkFileTransferEtaTest tests/filetransferetatest.cpp)
@@ -591,19 +603,19 @@ if(WAVELINK_BUILD_INTERNAL_TESTS)
         src/hardware/serialhandler.cpp src/hardware/serialhandler.h
         src/hardware/networkhandler.cpp src/hardware/networkhandler.h
         src/hardware/csvrecordingwriter.cpp src/hardware/wlrrecordingwriter.cpp)
-    target_link_libraries(WaveLinkDataSafetyAuditTest PRIVATE WaveLinkProtocols Qt5::Core Qt5::SerialPort Qt5::Network)
+    target_link_libraries(WaveLinkDataSafetyAuditTest PRIVATE WaveLinkProtocols Qt5::Core Qt5::SerialPort ${WAVELINK_NETWORK_LIBRARIES})
     add_test(NAME WaveLinkDataSafetyAudit COMMAND WaveLinkDataSafetyAuditTest)
     set_tests_properties(WaveLinkDataSafetyAudit PROPERTIES TIMEOUT 45)
     add_executable(WaveLinkTcpBindingTest tests/tcpbindingtest.cpp
         src/hardware/networkhandler.cpp src/hardware/networkhandler.h
         src/hardware/csvrecordingwriter.cpp src/hardware/wlrrecordingwriter.cpp)
-    target_link_libraries(WaveLinkTcpBindingTest PRIVATE WaveLinkProtocols Qt5::Network)
+    target_link_libraries(WaveLinkTcpBindingTest PRIVATE WaveLinkProtocols ${WAVELINK_NETWORK_LIBRARIES})
     add_test(NAME WaveLinkTcpBinding COMMAND WaveLinkTcpBindingTest)
     set_tests_properties(WaveLinkTcpBinding PROPERTIES TIMEOUT 30)
     add_executable(WaveLinkUdpTest tests/udptest.cpp
         src/hardware/networkhandler.cpp src/hardware/networkhandler.h
         src/hardware/csvrecordingwriter.cpp src/hardware/wlrrecordingwriter.cpp)
-    target_link_libraries(WaveLinkUdpTest PRIVATE WaveLinkProtocols Qt5::Network)
+    target_link_libraries(WaveLinkUdpTest PRIVATE WaveLinkProtocols ${WAVELINK_NETWORK_LIBRARIES})
     add_test(NAME WaveLinkUdp COMMAND WaveLinkUdpTest)
     set_tests_properties(WaveLinkUdp PROPERTIES TIMEOUT 30)
     add_executable(WaveLinkRawRecordingTest tests/rawrecordingtest.cpp
@@ -611,7 +623,7 @@ if(WAVELINK_BUILD_INTERNAL_TESTS)
         src/hardware/networkhandler.cpp src/hardware/networkhandler.h
         src/hardware/ble/blestreamworker.cpp src/hardware/ble/blestreamworker.h
         src/hardware/csvrecordingwriter.cpp src/hardware/wlrrecordingwriter.cpp)
-    target_link_libraries(WaveLinkRawRecordingTest PRIVATE WaveLinkProtocols Qt5::SerialPort Qt5::Network)
+    target_link_libraries(WaveLinkRawRecordingTest PRIVATE WaveLinkProtocols Qt5::SerialPort ${WAVELINK_NETWORK_LIBRARIES})
     target_compile_definitions(WaveLinkRawRecordingTest PRIVATE WAVELINK_PROTOCOL_EXAMPLE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/protocolfixtures")
     add_test(NAME WaveLinkRawRecording COMMAND WaveLinkRawRecordingTest)
     set_tests_properties(WaveLinkRawRecording PROPERTIES TIMEOUT 45)

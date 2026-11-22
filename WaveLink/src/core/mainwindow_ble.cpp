@@ -5,6 +5,7 @@
 #include "debuglogger.h"
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QVBoxLayout>
 #include <QJsonDocument>
 #include <QMessageBox>
 #include <QSignalBlocker>
@@ -14,6 +15,15 @@
 #include "ble/bleprofilestore.h"
 #include "ble/blechannelpolicy.h"
 #include <QSysInfo>
+
+namespace {
+QString bleDeviceLabel(const QJsonObject &device)
+{
+    if (device.isEmpty()) return {};
+    return device.value("name").toString() + QStringLiteral(" · ") +
+        QString::number(device.value("address").toString().toULongLong(), 16).toUpper().rightJustified(12, '0');
+}
+}
 
 QWidget *MainWindow::createBlePage()
 {
@@ -27,10 +37,22 @@ QWidget *MainWindow::createBlePage()
     btnBleScan = new QPushButton(QStringLiteral("扫描…"));
     auto target = new QHBoxLayout; target->addWidget(editBleDevice, 1); target->addWidget(btnBleScan);
     form->addRow(QStringLiteral("目标设备"), target);
-    lblBleStatus = new QLabel(QStringLiteral("连接后发现服务并选择收发特征"));
+    m_bleInlinePanel = new QWidget(page);
+    m_bleInlinePanel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    auto services = new QVBoxLayout(m_bleInlinePanel);
+    services->setContentsMargins(0, 0, 0, 0);
+    m_bleInlineApply = new QPushButton(QStringLiteral("应用通道并重连"));
+    m_bleInlineApply->setObjectName("bleInlineApplyChannels");
+    m_bleInlineApply->setToolTip(QStringLiteral("保存选中的收发通道，并重新连接使其生效。"));
+    services->addWidget(m_bleInlineApply);
+    form->addRow(m_bleInlinePanel);
+    m_bleInlinePanel->hide();
+    connect(m_bleInlineApply, &QPushButton::clicked, this, &MainWindow::applyBleInlineChannels);
+    lblBleStatus = new QLabel(QStringLiteral("选择设备后可连接或配置收发通道"));
+    lblBleStatus->setObjectName("bleConnectionStatus");
     lblBleStatus->setWordWrap(true); lblBleStatus->setMinimumWidth(0);
     lblBleStatus->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    form->addRow(QStringLiteral("BLE 状态"), lblBleStatus);
+    form->addRow(lblBleStatus);
     ConnectionHints::row(form, target, "扫描并选择 BLE 外设；经典蓝牙虚拟 COM 口请使用串口接口。");
     ConnectionHints::row(form, lblBleStatus, "显示蓝牙连接、服务发现及收发通道配置状态。");
     btnBleScan->setToolTip("搜索附近可连接的 BLE 外设并选择目标，不自动发送数据。");
@@ -48,9 +70,9 @@ QWidget *MainWindow::createBlePage()
     connect(btnBleScan, &QPushButton::clicked, this, &MainWindow::selectBleDevice);
     connect(help, &QPushButton::clicked, this, [this] {
         QMessageBox::information(this, QStringLiteral("BLE 连接与数据调试"), QStringLiteral(
-            "1. 扫描并选择可连接的 BLE 外设，点击连接。\n"
-            "2. 首次连接在快速配置中选择接收/发送通道，也可先仅接收候选通道；候选仅按属性推荐，不会发送探测命令。发送须确认透传用途。\n"
-            "3. 写入方式按特征自动选择，有响应写优先；完整服务树、模板与发送参数位于高级配置。已知固件升级服务不参与推荐。\n"
+            "1. 扫描并选择 BLE 设备。Nordic UART 完整匹配或已验证的通道可直接连接。\n"
+            "2. 自定义设备先打开‘收发配置’，读取服务后选择收发通道。可保存供下次连接，或直接应用并连接。\n"
+            "3. 服务列表支持逐行选择接收、发送或读取一次特征值。模板、写入方式与发送参数位于高级配置。已知固件升级服务不参与推荐。\n"
             "4. 默认 Raw 文本/HEX 收发；需要波形时选择 FireWater、JustFloat 或匹配的自定义协议。CBF/IR/RED 可在自定义协议管理中从键值设备模板创建。\n"
             "5. 数值协议支持 CSV/WLR 录制，记录原始通知接收时间；绘图限流不影响已解析数据的录制。\n"
             "6. 默认 20 字节 / 10 ms 分包；在‘收发配置 → 高级发送控制’调整，并查看实际生效值。发送期间不允许改参数或交错发送其他命令。\n\n"
@@ -106,6 +128,9 @@ void MainWindow::setupBleBackend()
             QTimer::singleShot(0, this, &QWidget::close);
         }
     });
+    connect(bleClient, &BleHostClient::filePacketSubmitted, this, [this](const QByteArray &data) {
+        appendTransmitEcho(data, true);
+    });
     connect(bleClient, &BleHostClient::fileSendProgress, this, [this](qint64 completed, qint64 total) {
         updateFileSendEta(completed, total);
         if (total < 0) { progressBarFile->setRange(0, 0); setFileSendProgressHint(QStringLiteral("后台正在打开发送文件…")); return; }
@@ -141,9 +166,12 @@ void MainWindow::setupBleBackend()
         // Do not overwrite a corrupt saved profile or change next-connection
         // UUIDs when the user only applied live sending parameters.
         if (error.isEmpty()) {
+            const auto signature = BleChannelPolicy::fingerprint(m_bleCharacteristics);
+            const bool preserveValidation = !signature.isEmpty() &&
+                (next.isEmpty() || next.value("_validatedGatt").toString() == signature);
             if (next.isEmpty()) next = m_bleAppliedProfile;
             next["schemaVersion"] = 3; next["packetSize"] = s.value("packetSize"); next["intervalMs"] = s.value("intervalMs");
-            store.saveDeviceProfile(m_bleDevice, next, error);
+            store.saveDeviceProfile(m_bleDevice, next, error, preserveValidation ? m_bleCharacteristics : QJsonArray());
         }
         if (!error.isEmpty()) QMessageBox::warning(this, QStringLiteral("参数已生效，但保存失败"), error);
         updateBleControls();
@@ -208,41 +236,62 @@ void MainWindow::setupBleBackend()
             bleWorker->beginSession(m_bleDataSession, m_appliedProtocol, m_appliedProfile);
             finishConnectionOpen(4); updateBleControls();
             lblTxCount->setToolTip(QStringLiteral("BLE Tx 为 GATT 写入完成/提交的字节数；不代表设备业务程序已经执行。"));
+            if (!m_bleAppliedProfile.isEmpty()) {
+                QSettings settings("WaveLink", "WaveLink"); QString error;
+                if (!BleProfileStore(settings).saveDeviceProfile(m_bleDevice, m_bleAppliedProfile, error, m_bleCharacteristics))
+                    statusBar()->showMessage(QStringLiteral("BLE 已连接，配置未保存：%1").arg(error), 8000);
+            }
         }
     });
     connect(bleClient, &BleHostClient::characteristicsDiscovered, this, [this](const QJsonArray &entries) {
         if (m_activeInterfaceType != 4 || m_connectionState != ConnectionState::Connecting || m_bleConfigOpen) return;
-        QSettings settings("WaveLink", "WaveLink");
         m_bleCharacteristics = entries;
-        QJsonObject profile;
-        QString error; BleProfileStore store(settings);
-        const auto saved = store.deviceProfile(m_bleDevice, error);
-        if (!error.isEmpty()) QMessageBox::warning(this, QStringLiteral("请重新核对 BLE 配置"), error);
+        if (m_bleDiscoverForConfig) {
+            m_bleDiscoverForConfig = false;
+            editBleProfiles(true);
+            return;
+        }
+        QSettings settings("WaveLink", "WaveLink");
+        QString error;
+        const auto saved = BleProfileStore(settings).deviceProfile(m_bleDevice, error);
         int rx = 0, tx = 0;
-        if (BleChannelPolicy::quickConnect(entries, saved, rx, tx)) {
-            BleProfileStore::normalize(saved, m_bleAppliedProfile, error);
-            if (bleClient->configure(rx, tx, saved.value("withoutResponse").toBool(),
-                                     saved.value("packetSize").toInt(20), saved.value("intervalMs").toInt(10), false)) return;
-            m_bleAppliedProfile = {};
-            if (bleClient->state() != BleHostClient::State::AwaitingConfiguration) return;
+        const auto profile = error.isEmpty() ? BleChannelPolicy::connectionProfile(entries, saved, rx, tx) : QJsonObject();
+        QString hint = QStringLiteral("请先打开「收发配置…」确认收发通道。");
+        if (!profile.isEmpty()) {
+            const int packet = profile.value("packetSize").toInt(20), interval = profile.value("intervalMs").toInt(10);
+            if (!bleClient->supportsSendControl() && (packet != 20 || interval != 10)) {
+                hint = QStringLiteral("请在「收发配置…」恢复兼容发送参数。");
+            } else if (!tx || BleDialogs::confirmSendParameters(this, packet, interval)) {
+                if (bleClient->state() != BleHostClient::State::AwaitingConfiguration) return;
+                m_bleAppliedProfile = profile;
+                if (bleClient->configure(rx, tx, profile.value("withoutResponse").toBool(), packet, interval, true)) return;
+                if (bleClient->state() != BleHostClient::State::AwaitingConfiguration) return;
+            } else {
+                hint = QStringLiteral("已取消连接。可在「收发配置…」调整发送参数。");
+            }
         }
-        m_bleConfigOpen = true;
-        const QString identity = m_bleDevice.value("name").toString() + " · " +
-            QString::number(m_bleDevice.value("address").toString().toULongLong(), 16).toUpper().rightJustified(12, '0');
-        const bool configured = BleDialogs::configure(bleClient, entries, saved, profile, this, identity);
-        m_bleConfigOpen = false;
-        if (configured) {
-            m_bleAppliedProfile = profile;
-            if (!store.saveDeviceProfile(m_bleDevice, profile, error, entries)) QMessageBox::warning(this, QStringLiteral("BLE 配置未保存"), error);
-            updateBleControls();
-        } else if (m_connectionState != ConnectionState::Error) {
-            bleClient->disconnectDevice(); finishConnectionClosed(4, false); updateBleControls();
-        }
+        if (m_connectionState != ConnectionState::Connecting) return;
+        bleClient->disconnectDevice();
+        finishConnectionClosed(4, false);
+        updateBleControls();
+        lblBleStatus->setText(hint);
+        statusBar()->showMessage(hint, 6000);
     });
     connect(bleClient, &BleHostClient::errorOccurred, this, [this](const QString &message, bool fatal) {
         DebugLogger::instance().log(QString("BLE: %1").arg(message), fatal ? "ERROR" : "WARN");
         if (!fatal || m_activeInterfaceType != 4 ||
             (m_connectionState != ConnectionState::Connecting && m_connectionState != ConnectionState::Connected)) return;
+        if (m_bleDiscoverForConfig) {
+            m_bleDiscoverForConfig = false;
+            finishConnectionClosed(4, false);
+            updateBleControls();
+            lblBleStatus->setText(QStringLiteral("服务读取失败，可编辑预设或重新扫描设备。"));
+            QTimer::singleShot(0, this, [this] {
+                if (comboInterface->currentData().toInt() == 4 && bleClient->state() == BleHostClient::State::Idle &&
+                    !m_connectionOperationPending && !m_bleConfigOpen) editBleProfiles();
+            });
+            return;
+        }
         if (cmdWindow) cmdWindow->forceStopAllTimers();
         finishConnectionClosed(4, false); setConnectionState(ConnectionState::Error, 4); updateBleControls();
         // Let an open configuration dialog close before showing diagnostics.
@@ -264,16 +313,24 @@ void MainWindow::selectBleDevice()
 }
 void MainWindow::openCloseBleConnection()
 {
-    if (!bleClient) return;
+    if (!bleClient || m_bleConfigOpen) return;
     if (connectionIsReady() || m_connectionOperationPending) {
+        m_bleDiscoverForConfig = false;
         if (cmdWindow) cmdWindow->forceStopAllTimers();
         bleClient->disconnectDevice(); finishConnectionClosed(4, false); updateBleControls(); return;
     }
     if (m_bleDevice.isEmpty()) selectBleDevice();
     if (m_bleDevice.isEmpty()) return;
+    startBleConnection(false);
+}
+
+void MainWindow::startBleConnection(bool discoverForConfiguration)
+{
+    m_bleDiscoverForConfig = discoverForConfiguration;
     setConnectionState(ConnectionState::Connecting, 4);
     comboInterface->setEnabled(false); btnBleScan->setEnabled(false);
-    btnOpenClose->setEnabled(true); btnOpenClose->setText(QStringLiteral("取消 BLE 连接"));
+    btnOpenClose->setEnabled(true);
+    btnOpenClose->setText(discoverForConfiguration ? QStringLiteral("取消读取服务") : QStringLiteral("取消 BLE 连接"));
     bleClient->connectDevice(m_bleDevice.value("address").toString(), m_bleDevice.value("addressType").toInt());
 }
 void MainWindow::updateBleControls()
@@ -282,6 +339,7 @@ void MainWindow::updateBleControls()
     const bool ble = comboInterface->currentData().toInt() == 4;
     const bool udp = comboInterface->currentData().toInt() == 5;
     const bool ready = bleClient && bleClient->state() == BleHostClient::State::Ready && connectionIsReady();
+    updateBleInlineChannels(ble && ready);
     const bool sendingFile = bleClient && bleClient->fileSendBusy();
     const bool serialBlocked = comboInterface->currentData().toInt() == 0 && (m_serialBreakActive || m_serialBreakPending || m_serialSendCancelPending || (fileSendTimer && fileSendTimer->isActive()));
     btnToggleRecord->setEnabled(!m_bleRecordStopPending && (!ble || isRecording || (ready && bleClient->canReceive() && comboProtocol->currentIndex() != 0)));
@@ -298,41 +356,172 @@ void MainWindow::updateBleControls()
         btnStopSendFile->setEnabled(true);
     }
     btnBleScan->setEnabled(!m_connectionOperationPending && !connectionIsReady());
+    btnBleProfiles->setEnabled(!m_connectionOperationPending);
     updateProtocolControls();
     updateConsoleSendControls();
     if (ble && !bleClient->available()) lblBleStatus->setText(QStringLiteral("BLE 辅助程序尚未部署，请先构建"));
     else if (ble && ready && !m_bleAppliedProfile.isEmpty()) {
         const auto s = bleClient->sendSettings();
-        lblBleStatus->setText(QStringLiteral("收发就绪 · 接收%1 · 发送%2 · 实际 %3 字节/%4 ms")
+        lblBleStatus->setText(QStringLiteral("已连接 · 接收%1 · 发送%2")
             .arg(bleClient->canReceive() ? QStringLiteral("启用") : QStringLiteral("未配置"),
-                 s.value("blocked").toBool() ? QStringLiteral("暂停（请确认参数）") : s.value("pending").toBool() ? QStringLiteral("等待参数应用") : bleClient->canSend() ? QStringLiteral("启用") : QStringLiteral("未配置"))
-            .arg(s.value("effectivePacket").toInt(20)).arg(s.value("intervalMs").toInt(10)));
-        lblBleStatus->setToolTip(QStringLiteral("设置分包 %1 字节；MTU %2。实际分包受已知能力限制，提速并不保证外设业务层接收。")
-            .arg(s.value("packetSize").toInt(20)).arg(s.value("mtu").toInt() ? QString::number(s.value("mtu").toInt()) : QStringLiteral("未知")));
+                 s.value("blocked").toBool() ? QStringLiteral("暂停") : s.value("pending").toBool() ? QStringLiteral("待应用") :
+                 bleClient->canSend() ? QStringLiteral("启用") : QStringLiteral("未配置")));
+        lblBleStatus->setToolTip(QStringLiteral("实际分包 %1 字节 / %2 ms，设置分包 %3 字节，MTU %4。")
+            .arg(s.value("effectivePacket").toInt(20)).arg(s.value("intervalMs").toInt(10)).arg(s.value("packetSize").toInt(20))
+            .arg(s.value("mtu").toInt() ? QString::number(s.value("mtu").toInt()) : QStringLiteral("未知")));
     }
+}
+
+bool MainWindow::canEditBleChannels() const
+{
+    return bleClient && bleClient->state() == BleHostClient::State::Ready &&
+        connectionIsReady() && m_activeInterfaceType == 4 && !m_bleConfigOpen &&
+        !isRecording && !m_bleRecordStopPending && !bleClient->sendBusy() && !bleClient->readPending();
+}
+
+void MainWindow::updateBleInlineChannels(bool ready)
+{
+    if (!m_bleInlinePanel) return;
+    if (!ready || m_bleCharacteristics.isEmpty() || m_bleAppliedProfile.isEmpty()) {
+        if (m_bleInlineView) {
+            m_bleInlinePanel->hide();
+            m_bleInlineView->hide();
+            m_bleInlineView->deleteLater();
+            m_bleInlineView = nullptr;
+            if (comboInterface->currentData().toInt() == 4) updateInterfaceStackHeight();
+        }
+        return;
+    }
+    bool resizePage = false;
+    if (!m_bleInlineView) {
+        const auto resolve = [&](const QString &prefix, int properties) {
+            return BleChannelPolicy::resolve(m_bleCharacteristics, m_bleAppliedProfile.value(prefix + "Service").toString(),
+                m_bleAppliedProfile.value(prefix + "Uuid").toString(), properties);
+        };
+        m_bleInlineActive = {resolve("rx", 16 | 32), resolve("tx", 4 | 8)};
+        m_bleInlineDraft = m_bleInlineActive;
+        const auto select = [this](int &direction, int handle) {
+            direction = handle;
+            updateBleInlineChannels(true);
+        };
+        m_bleInlineView = new GattChannels(m_bleCharacteristics, bleClient, m_bleInlinePanel,
+            [this, select](int handle) { select(m_bleInlineDraft.first, handle); },
+            [this, select](int handle) { select(m_bleInlineDraft.second, handle); }, true);
+        m_bleInlineView->refresh = [this] { updateBleControls(); updateInterfaceStackHeight(); };
+        static_cast<QVBoxLayout *>(m_bleInlinePanel->layout())->insertWidget(0, m_bleInlineView);
+        m_bleInlinePanel->show();
+        resizePage = true;
+    }
+    const bool editable = canEditBleChannels();
+    const bool changed = m_bleInlineDraft != m_bleInlineActive;
+    m_bleInlineView->updateSelection(m_bleInlineDraft.first, m_bleInlineDraft.second, editable, editable);
+    m_bleInlineApply->setEnabled(editable && (m_bleInlineDraft.first || m_bleInlineDraft.second));
+    if (m_bleInlineApply->isHidden() == changed) {
+        m_bleInlineApply->setVisible(changed);
+        resizePage = true;
+    }
+    if (resizePage) updateInterfaceStackHeight();
+}
+
+void MainWindow::applyBleInlineChannels()
+{
+    if (!canEditBleChannels() || m_bleInlineDraft == m_bleInlineActive) return;
+    const auto chosen = m_bleInlineDraft;
+    auto profile = m_bleAppliedProfile;
+    const auto setChannel = [&](const QString &prefix, int handle) {
+        for (const auto &entry : m_bleCharacteristics) {
+            const auto c = entry.toObject();
+            if (handle <= 0 || c.value("handle").toInt() != handle) continue;
+            profile[prefix + "Service"] = c.value("service");
+            profile[prefix + "Uuid"] = c.value("uuid");
+            return c.value("properties").toInt();
+        }
+        profile[prefix + "Service"] = QString();
+        profile[prefix + "Uuid"] = QString();
+        return 0;
+    };
+    setChannel("rx", chosen.first);
+    const int txProperties = setChannel("tx", chosen.second);
+    if (chosen.second != m_bleInlineActive.second) profile["withoutResponse"] = chosen.second && !(txProperties & 8);
+    profile["stream"] = chosen.second != 0;
+    auto checked = profile;
+    checked["_validatedGatt"] = BleChannelPolicy::fingerprint(m_bleCharacteristics);
+    int rx = 0, tx = 0;
+    if (!BleChannelPolicy::validatedChannels(m_bleCharacteristics, checked, rx, tx) ||
+        chosen != qMakePair(rx, tx)) {
+        statusBar()->showMessage(QStringLiteral("所选通道无法用于快捷重连，请在「收发配置…」中核对。"), 8000);
+        return;
+    }
+    const auto nus = BleChannelPolicy::nordicUart(m_bleCharacteristics);
+    if (tx && chosen != qMakePair(nus.rx, nus.tx) && !BleDialogs::confirmByteStream(this)) return;
+    if (!canEditBleChannels() || chosen != m_bleInlineDraft) return;
+    QSettings settings("WaveLink", "WaveLink"); QString error;
+    if (!BleProfileStore(settings).saveDeviceProfile(m_bleDevice, profile, error, m_bleCharacteristics)) {
+        QMessageBox::warning(this, QStringLiteral("BLE 配置未保存"), error);
+        return;
+    }
+    reconnectBleDevice();
 }
 
 void MainWindow::showBleProfiles()
 {
-    if (!bleClient || m_bleConfigOpen) return;
+    if (!bleClient || m_bleConfigOpen || m_connectionOperationPending) return;
+    if (!connectionIsReady() && bleClient->available()) {
+        if (m_bleDevice.isEmpty()) selectBleDevice();
+        if (m_bleDevice.isEmpty()) return;
+        startBleConnection(true);
+        return;
+    }
+    editBleProfiles();
+}
+
+void MainWindow::editBleProfiles(bool discoveredForConfiguration)
+{
     QSettings settings("WaveLink", "WaveLink"); BleProfileStore store(settings); QString error;
     const auto next = store.deviceProfile(m_bleDevice, error);
     if (!error.isEmpty()) QMessageBox::warning(this, QStringLiteral("保存配置读取失败"), error);
-    const bool ready = connectionIsReady() && m_activeInterfaceType == 4;
-    const bool editable = !m_connectionOperationPending && !isRecording && !m_bleRecordStopPending && !bleClient->sendBusy() && !bleClient->readPending();
-    const auto action = BleDialogs::manageProfiles(m_bleAppliedProfile, next, m_bleCharacteristics, ready, editable, this, bleClient);
-    if (action.applyCurrent) { updateBleControls(); return; } // Persisted only after the helper's acknowledgement.
-    if (!action.saveNext) return;
-    if (!store.saveDeviceProfile(m_bleDevice, action.profile, error)) { QMessageBox::warning(this, QStringLiteral("BLE 配置未保存"), error); return; }
+    const bool editable = !isRecording && !m_bleRecordStopPending && !bleClient->sendBusy() && !bleClient->readPending();
+    m_bleConfigOpen = true;
+    const auto action = BleDialogs::configure(bleClient, m_bleCharacteristics, m_bleAppliedProfile, next, editable, this, bleDeviceLabel(m_bleDevice));
+    m_bleConfigOpen = false;
+    if (action.kind == BleDialogs::ProfileAction::Applied) {
+        m_bleAppliedProfile = action.profile;
+        if (!store.saveDeviceProfile(m_bleDevice, action.profile, error, m_bleCharacteristics))
+            QMessageBox::warning(this, QStringLiteral("BLE 配置未保存"), error);
+        updateBleControls();
+        return;
+    }
+    const bool haveServices = discoveredForConfiguration || bleClient->state() == BleHostClient::State::Ready;
+    if (discoveredForConfiguration && m_connectionState == ConnectionState::Connecting) {
+        bleClient->disconnectDevice();
+        finishConnectionClosed(4, false);
+        updateBleControls();
+    }
+    if (action.kind == BleDialogs::ProfileAction::SendSettingsApplied) { updateBleControls(); return; }
+    if (action.kind != BleDialogs::ProfileAction::SaveNext && action.kind != BleDialogs::ProfileAction::Reconnect) return;
+    auto checked = action.profile;
+    checked["_validatedGatt"] = BleChannelPolicy::fingerprint(m_bleCharacteristics);
+    int rx = 0, tx = 0;
+    const bool validated = haveServices && BleChannelPolicy::validatedChannels(m_bleCharacteristics, checked, rx, tx);
+    if (!store.saveDeviceProfile(m_bleDevice, action.profile, error, validated ? m_bleCharacteristics : QJsonArray())) {
+        QMessageBox::warning(this, QStringLiteral("BLE 配置未保存"), error);
+        return;
+    }
+    if (discoveredForConfiguration) lblBleStatus->setText(validated ? QStringLiteral("收发配置已保存，可连接设备。") :
+        QStringLiteral("配置已保存。通道无法唯一匹配时，请从「收发配置…」应用并连接。"));
     // A disconnect/error may arrive while the modal dialog is open. Never turn
     // a reconnect action into an unsolicited new connection after such a loss.
-    if (action.reconnect && connectionIsReady() && m_activeInterfaceType == 4 && !isRecording && !m_bleRecordStopPending && !bleClient->sendBusy()) {
-        openCloseBleConnection();
-        QTimer::singleShot(0, this, [this] {
-            if (comboInterface->currentData().toInt() == 4 && !connectionIsReady() && !m_connectionOperationPending &&
-                !isRecording && !m_bleRecordStopPending && bleClient->state() == BleHostClient::State::Idle) openCloseBleConnection();
-        });
-    }
+    if (action.kind == BleDialogs::ProfileAction::Reconnect) reconnectBleDevice();
+}
+
+void MainWindow::reconnectBleDevice()
+{
+    if (!canEditBleChannels()) return;
+    openCloseBleConnection();
+    QTimer::singleShot(0, this, [this] {
+        if (comboInterface->currentData().toInt() == 4 && !connectionIsReady() && !m_connectionOperationPending &&
+            !isRecording && !m_bleRecordStopPending && bleClient->state() == BleHostClient::State::Idle) openCloseBleConnection();
+    });
 }
 void MainWindow::showBleDiagnostics()
 {

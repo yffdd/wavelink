@@ -88,6 +88,18 @@ int main(int argc, char **argv)
             event.insert("event", "services"); event.insert("characteristics", QJsonArray{
                 QJsonObject{{"service", "0000ffe0-0000-1000-8000-00805f9b34fb"}, {"uuid", "0000ffe1-0000-1000-8000-00805f9b34fb"}, {"handle", 1}, {"serviceHandle", 2}, {"properties", 26}}});
             if (address == "7") { auto entries = event.value("characteristics").toArray(); auto duplicate = entries[0].toObject(); duplicate["handle"] = 3; entries.append(duplicate); event["characteristics"] = entries; }
+            if (address == "17") {
+                const QString service = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+                event["characteristics"] = QJsonArray{
+                    QJsonObject{{"service", "00001801-0000-1000-8000-00805f9b34fb"}, {"uuid", "00002a05-0000-1000-8000-00805f9b34fb"},
+                        {"handle", 3}, {"serviceHandle", 1}, {"properties", 32}},
+                    QJsonObject{{"service", "00001800-0000-1000-8000-00805f9b34fb"}, {"uuid", "00002a00-0000-1000-8000-00805f9b34fb"},
+                        {"handle", 8}, {"serviceHandle", 7}, {"properties", 2}},
+                    QJsonObject{{"service", service}, {"uuid", "6e400003-b5a3-f393-e0a9-e50e24dcca9e"},
+                        {"handle", 17}, {"serviceHandle", 2}, {"properties", 16}},
+                    QJsonObject{{"service", service}, {"uuid", "6e400002-b5a3-f393-e0a9-e50e24dcca9e"},
+                        {"handle", 20}, {"serviceHandle", 2}, {"properties", 4}}};
+            }
             send(event);
         } else if (op == "configure" || op == "sendSettings") {
             if (address == "14" && op == "sendSettings") {

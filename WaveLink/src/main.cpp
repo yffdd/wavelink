@@ -11,7 +11,7 @@
 #include <windows.h>
 
 #ifndef WAVELINK_VERSION
-#define WAVELINK_VERSION "0.14"
+#define WAVELINK_VERSION "0.15"
 #endif
 #include <dbghelp.h>
 #include <psapi.h>

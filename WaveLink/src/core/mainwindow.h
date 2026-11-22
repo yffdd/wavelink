@@ -9,6 +9,7 @@
 #include <QTextEdit>
 #include <QPlainTextEdit>
 #include "systempreferences.h"
+#include "receiveansicolors.h"
 #include <QCheckBox>
 #include <QElapsedTimer>
 #include "rangeslider.h"
@@ -44,6 +45,8 @@
 #include <QLineEdit>
 #include <QStringList>
 #include "ble/blehostclient.h"
+
+class QDialog;
 
 class RightAlignedTicker : public QCPAxisTicker
 {
@@ -151,8 +154,9 @@ private slots:
     void handleRecordingError(const QString &errorMsg);
     void handleNetworkError(const QString &errorMsg);
     void handleNetworkStateChanged(bool isConnected);
-    void handleClientConnected(const QString &clientIp);
-    void handleClientDisconnected();
+    void handleClientConnected(const QString &clientIp, quint64 sendSession);
+    void handleClientDisconnected(const QString &reason);
+    void handleTcpServerWaitChanged(const QString &reason);
     void equalizePlotHeights();
     
     void onSpectrumTimer();
@@ -194,6 +198,12 @@ private:
     void openCloseBleConnection();
     void updateBleControls();
     void showBleProfiles();
+    void editBleProfiles(bool discoveredForConfiguration = false);
+    void startBleConnection(bool discoverForConfiguration);
+    void updateBleInlineChannels(bool ready);
+    bool canEditBleChannels() const;
+    void applyBleInlineChannels();
+    void reconnectBleDevice();
     void showBleDiagnostics();
     QString bleDiagnosticText(bool includeIdentity) const;
     BleHostClient *bleClient = nullptr;
@@ -211,7 +221,12 @@ private:
     QJsonObject m_bleDevice;
     QJsonObject m_bleAppliedProfile;
     QJsonArray m_bleCharacteristics;
+    QWidget *m_bleInlinePanel = nullptr;
+    class GattChannels *m_bleInlineView = nullptr;
+    QPushButton *m_bleInlineApply = nullptr;
+    QPair<int, int> m_bleInlineActive, m_bleInlineDraft;
     bool m_bleConfigOpen = false;
+    bool m_bleDiscoverForConfig = false;
     std::unique_ptr<DataProtocols::ProtocolProfileStore> m_protocolStore;
     DataProtocols::ProtocolSelection m_appliedProtocol, m_pendingProtocol;
     DataProtocols::ProtocolProfile m_appliedProfile, m_pendingProfile;
@@ -256,13 +271,14 @@ private:
     void updateChannelDockMinimumWidth();
     int defaultBottomDockHeight() const;
     void updateSpectrumFooterLayout();
+    void updateSpectrumLegendLayout();
     bool prepareCacheForRecording();
     bool hasEnoughDiskSpaceForRecording(QString *details = nullptr) const;
     void recoverInterruptedRecordings();
     void stopRecordingSafely(const QString &errorMessage = QString());
     qint64 getDirSize(const QString &dirPath);
     void updateSerialPortsList();
-    bool sendDataToCurrentInterface(const QByteArray &data);
+    bool sendDataToCurrentInterface(const QByteArray &data, bool hexEcho = false);
     bool consoleSendPayload(QByteArray &data, QString &error) const;
     QString consoleSendUnavailableReason() const;
     void stopConsolePeriodicSend(const QString &reason = QString());
@@ -270,6 +286,7 @@ private:
     void setDataTransceiveMode(bool enabled, bool restoringSavedLayout = false);
     void finishConnectionOpen(int interfaceType);
     void finishConnectionClosed(int interfaceType, bool clearPendingData);
+    void updateTcpServerPeerNotice();
     void showCopyableSerialError(const QString &title, const QString &errorMsg, int errorCode);
     void requestSerialBreak(bool enabled, int durationMs = 0);
     void updateSerialBreakControls();
@@ -297,8 +314,14 @@ private:
     QLabel *lblUdpEndpoint = nullptr;
     QLabel *lblServerConnCount;
     QLabel *lblServerCurrentConn;
+    quint64 m_tcpServerSendSession = 0;
+    QString m_tcpServerWaitReason;
+    QDialog *m_tcpServerPeerNotice = nullptr;
+    QLabel *m_tcpServerPeerNoticeText = nullptr;
+    QString m_tcpServerDisconnectReason;
 
     QComboBox *comboProtocol;
+    QPushButton *btnDemoProtocolInfo = nullptr;
     QPushButton *btnCustomProtocols = nullptr;
     QComboBox *comboEndianness;
     QComboBox *comboPorts;
@@ -329,7 +352,9 @@ private:
     QPlainTextEdit *textReceive;
     QTextEdit *textSend;
     QComboBox *comboReceiveLines = nullptr;
-    void appendReceiveText(const QString &text);
+    void appendReceiveText(const QString &text, const QString &prefix = {}, bool colorize = false);
+    void appendTransmitEcho(const QByteArray &data, bool hex = false);
+    void resetReceiveTextDecoder();
     void trimReceiveText();
     void applySystemPreferences(const SystemPreferences &preferences, bool persist);
     SystemPreferences m_systemPreferences;
@@ -338,6 +363,7 @@ private:
     QPushButton *btnSaveReceive = nullptr;
     QPushButton *btnCopyReceive = nullptr;
     QCheckBox *chkShowReceiveData;
+    QCheckBox *chkShowTransmitData;
     QCheckBox *chkHexReceive;
     QCheckBox *chkTimestamp;
     QComboBox *comboAppendNewline;
@@ -425,6 +451,7 @@ private:
     QStringList m_importedChannelNames;
     std::unique_ptr<class QTextDecoder> m_receiveDecoder;
     QString m_receiveDecoderEncoding;
+    ReceiveAnsiColors m_receiveAnsiColors;
     QVector<double> m_importedTimes;
     QVector<QVector<double>> m_importedData;
     QSharedPointer<OfflineWaveStore> m_pagedRaw, m_pagedData;
@@ -460,6 +487,8 @@ private:
     class QMainWindow *innerMainWindow;
     class PlotScrollArea *plotScrollArea = nullptr;
     RangeSlider *m_rangeSlider;
+    class GlobalTimeMeasurement *m_globalTimeMeasurement = nullptr;
+    void locateGlobalTimeInterval(double lower, double upper);
     
     struct PlotContext {
         class PlotMeasurementController *scope = nullptr;
@@ -475,13 +504,24 @@ private:
         class QCPItemText *measureDeltaText;
         class QCPItemText *heightText;
         class QCPItemText *widthText;
+        class QCPItemText *noChannelsSelectedText = nullptr;
         int measureState; // 0: no points, 1: 1 point, 2: 2 points
         QSharedPointer<RightAlignedTicker> ticker;
     };
     QList<PlotContext> allPlots;
+    int m_detachedWaveformHeight = 0; // Zero selects automatic sizing.
+    std::optional<int> m_manualPlotResizePressY;
+    bool m_measurementPlotHeightsLocked = false;
+    bool hasActivePlotMeasurements() const;
+    void updatePlotMeasurementLayout();
+    void syncPlotStackSizing(bool measurementsVisible);
+    void setDetachedWaveformHeight(int height);
+    void showDetachedHeightSettings();
+    bool isPlotHeightSeparator(const QPoint &position) const;
+    void showDetachedHeightDragHint();
     QColor m_mainPlotBackground, m_detachedPlotBackground; // Invalid means follow the system theme.
     void showPlotBackgroundSettings();
-    void applyWaveformPlotTheme(QCustomPlot *plot, bool isMain);
+    void applyWaveformPlotTheme(const PlotContext &ctx, bool isMain);
     void updateWaveformPlotThemes();
     // --- Filter Dock ---
     QDockWidget *filterDock;
@@ -536,7 +576,8 @@ private:
     void reapplyFiltersToImportedData();
     
     QVector<class QCPGraph*> channelGraphs;
-    QString receiveTextBuffer;
+    ReceiveConsoleBuffer::PendingText m_pendingReceiveText;
+    bool m_hasTransmitEcho = false;
     QByteArray m_defaultState;
     QByteArray m_defaultInnerState;
     QByteArray m_normalWindowStateBeforeDataMode;

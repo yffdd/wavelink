@@ -217,6 +217,7 @@ static int plotReadoutUiTests() {
     VERIFY(QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({1, 2}))));
     auto mainDock = window.findChild<QDockWidget *>(QStringLiteral("PlotDock_主视图")); VERIFY(mainDock);
     auto main = mainDock->findChild<QCustomPlot *>(); VERIFY(main && main->graphCount() == 2);
+    auto noChannels = main->findChild<QCPItemText *>("noChannelsSelectedText"); VERIFY(noChannels && !noChannels->visible());
     QListWidget *channels = nullptr;
     for (auto list : window.findChildren<QListWidget *>()) if (list->count() == 2 && list->itemWidget(list->item(0))) channels = list;
     VERIFY(channels);
@@ -295,8 +296,21 @@ static int plotReadoutUiTests() {
 
     // Neither individual checkboxes nor select-all may hide detached graphs.
     first->setChecked(false); VERIFY(!main->graph(0)->visible() && detached->graph(0)->visible());
+    VERIFY(noChannels->visible() && !detached->findChild<QCPItemText *>("noChannelsSelectedText"));
+    second->setChecked(true); VERIFY(!noChannels->visible());
     selectAll->setChecked(true); VERIFY(main->graph(0)->visible() && main->graph(1)->visible() && detached->graph(0)->visible());
     selectAll->setChecked(false); VERIFY(!main->graph(0)->visible() && !main->graph(1)->visible() && detached->graph(0)->visible());
+    VERIFY(noChannels->visible());
+    auto themeChoice = window.findChild<QComboBox *>("comboTheme"); VERIFY(themeChoice);
+    for (auto theme : {ThemeManager::LightTheme, ThemeManager::DarkTheme}) {
+        themeChoice->setCurrentIndex(themeChoice->findData(theme));
+        QApplication::processEvents(); main->replot();
+        const bool dark = theme == ThemeManager::DarkTheme;
+        VERIFY(noChannels->visible() && (dark ? noChannels->color().lightness() > 180 : noChannels->color().lightness() < 90));
+        const QRectF box(noChannels->topLeft->pixelPosition(), noChannels->bottomRight->pixelPosition());
+        VERIFY(QRectF(main->axisRect()->rect()).contains(box));
+        if (!artifactDirectory.isEmpty()) main->grab().save(artifactDirectory + (dark ? "/no-channels-dark.png" : "/no-channels-light.png"));
+    }
     const int mainCount = main->graph(0)->dataCount(), detachedCount = detached->graph(0)->dataCount();
     VERIFY(QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({16, 22}))));
     VERIFY(QMetaObject::invokeMethod(&window, "onPlotTimer"));
@@ -305,6 +319,7 @@ static int plotReadoutUiTests() {
     VERIFY(QMetaObject::invokeMethod(&window, "handleChannelsUpdated", Q_ARG(QVector<double>, QVector<double>({17, 23}))));
     VERIFY(QMetaObject::invokeMethod(&window, "onPlotTimer"));
     VERIFY(main->graph(0)->dataCount() == mainCount + 1 && detached->graph(0)->dataCount() == detachedCount + 1);
+    VERIFY(noChannels->visible());
     VERIFY(!main->graph(0)->visible() && detached->graph(0)->visible());
     // A channel unchecked BEFORE detaching also starts visible in its view.
     VERIFY(!second->isChecked() && detachPlotTestChannel(window, channels, 1));

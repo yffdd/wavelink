@@ -54,11 +54,16 @@ int main(int argc, char **argv)
     VERIFY(client.diagnostics().value("connectMs").toDouble(-1) >= 0 && client.diagnostics().value("discoverMs").toDouble(-1) >= 0);
     VERIFY(timestamps.size() == 2 && timestamps[0] > 1700000000000000000LL && timestamps[1] >= timestamps[0]);
     VERIFY(!client.sendData(QByteArray(256 * 1024 + 1, 'x')));
-    VERIFY(client.sendData(QByteArray(70, 'x'))); VERIFY(until([&] { return client.txCount() == 70; }));
+    VERIFY(client.readCharacteristic(1));
+    VERIFY(!client.readCharacteristic(1));
+    VERIFY(client.sendData(QByteArray(70, 'x')) && client.txCount() == 0);
+    VERIFY(until([&] { return readFinished == 2 && client.txCount() == 70; }));
     QTemporaryDir temp; QFile source(temp.filePath("send.bin")); VERIFY(source.open(QIODevice::WriteOnly));
     QByteArray fileData; for (int i = 0; i < 4207; ++i) fileData += char(i % 256);
     VERIFY(source.write(fileData) == fileData.size()); source.close();
     QString fileError; int fileSuccess = 0, fileStopped = 0; qint64 progress = -1;
+    QByteArray submittedFile;
+    QObject::connect(&client, &BleHostClient::filePacketSubmitted, [&](const QByteArray &bytes) { submittedFile += bytes; });
     QObject::connect(&client, &BleHostClient::fileSendFinished, [&](bool ok, const QString &) { ok ? ++fileSuccess : ++fileStopped; });
     QObject::connect(&client, &BleHostClient::fileSendProgress, [&](qint64 done, qint64 total) { if (total == fileData.size()) progress = done; });
     received.clear(); VERIFY(client.startFileSend(source.fileName(), fileError));
@@ -67,7 +72,7 @@ int main(int argc, char **argv)
     const bool completedFile = until([&] { return fileSuccess == 1; }, 45000);
     if (!completedFile) std::cerr << "file progress " << progress << " active " << client.fileSendActive() << " rx " << received.size() << " stopped " << fileStopped << " tx " << client.txCount() << "\n";
     VERIFY(completedFile);
-    VERIFY(progress == fileData.size() && received == fileData && !client.fileSendActive());
+    VERIFY(progress == fileData.size() && received == fileData && submittedFile == fileData && !client.fileSendActive());
     VERIFY(client.txCount() == 70 + quint64(fileData.size()));
     VERIFY(until([&] { return !client.fileSendBusy(); }));
     bool cancelOnData = true, cancelledPacketBlocked = false;

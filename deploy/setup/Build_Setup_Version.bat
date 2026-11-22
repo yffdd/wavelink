@@ -6,7 +6,7 @@ setlocal DisableDelayedExpansion
 :: Configuration: only installed tool paths are machine-specific.
 :: All generated files stay inside this script's setup directory.
 :: Set ENABLE_BLE to 0 for a release without the native BLE helper.
-:: BLE builds require Visual Studio 2022 C++ tools and a Windows SDK.
+:: BLE builds use MSVC, or a verified source-matched helper cache if unavailable.
 :: ================================================================
 set "ENABLE_BLE=1"
 set "QT_BIN=E:\software\Qt\Qt5.14.2\5.14.2\mingw73_64\bin"
@@ -59,6 +59,12 @@ echo ========================================
 :: signing key; never regenerate or embed it. No hosted files are uploaded.
 call :PREPARE_UPDATE_PUBLISHING
 if errorlevel 1 ( echo [ERROR] Update publishing preflight failed. Existing build files were not cleaned. & goto FAILED )
+
+:: Detect missing tools or an outdated helper BEFORE cleaning previous work.
+if "%ENABLE_BLE%"=="1" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\Build-BleHost.ps1" -Configuration Release -BuildDirectory "%BLE_BUILD%" -PreflightOnly
+    if errorlevel 1 ( echo [ERROR] BLE prerequisites are not ready. Existing build files were not cleaned. & goto FAILED )
+)
 
 :: Reset only the THREE exact child directories owned by this workflow.
 :: The validation rejects junctions, symbolic links and unexpected targets

@@ -5,6 +5,8 @@
 #include <QWidget>
 #include <QMainWindow>
 #include <QDockWidget>
+#include <QEvent>
+#include <QTimer>
 
 // restoreState() only knows docks present when its snapshot was saved. Later
 // plots must be explicitly restacked, rather than left in Qt's fallback layout.
@@ -42,22 +44,52 @@ public:
 
     void setDetachedViewCount(int count)
     {
+        setPlotSizing(count, m_manualHeight, m_measurementsVisible);
+    }
+
+    static int automaticStackMinimumHeight(int detachedCount)
+    {
+        return detachedCount >= 3 ? (detachedCount + 1) * 240 : 0;
+    }
+
+    void setPlotSizing(int count, bool manualHeight, bool measurementsVisible)
+    {
         m_detachedCount = count;
-        const bool scroll = count >= 3;
-        setVerticalScrollBarPolicy(scroll ? Qt::ScrollBarAlwaysOn : m_measurementsVisible ? Qt::ScrollBarAsNeeded : Qt::ScrollBarAlwaysOff);
-        if (widget()) {
-            // Include the main view. DPI-aware logical pixels, not screen pixels.
-            widget()->setMinimumHeight(scroll ? (count + 1) * 240 : 0);
-            widget()->updateGeometry();
+        m_manualHeight = manualHeight;
+        m_measurementsVisible = measurementsVisible;
+        setVerticalScrollBarPolicy(!manualHeight && count >= 3 ? Qt::ScrollBarAlwaysOn :
+            (manualHeight || measurementsVisible ? Qt::ScrollBarAsNeeded : Qt::ScrollBarAlwaysOff));
+        updateStackMinimum();
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == widget() && event->type() == QEvent::LayoutRequest &&
+            (m_measurementsVisible || m_manualHeight) && !m_updateQueued) {
+            m_updateQueued = true;
+            QTimer::singleShot(0, this, [this] {
+                m_updateQueued = false;
+                updateStackMinimum();
+            });
         }
+        return QScrollArea::eventFilter(watched, event);
     }
-    void setMeasurementBarsVisible(bool visible) {
-        if (m_measurementsVisible == visible) return;
-        m_measurementsVisible = visible; setDetachedViewCount(m_detachedCount);
-    }
+
 private:
+    void updateStackMinimum()
+    {
+        if (!widget()) return;
+        int height = m_manualHeight ? 0 : automaticStackMinimumHeight(m_detachedCount);
+        if (m_measurementsVisible || m_manualHeight)
+            height = qMax(height, widget()->minimumSizeHint().height());
+        if (widget()->minimumHeight() != height) widget()->setMinimumHeight(height);
+    }
+
     int m_detachedCount = 0;
+    bool m_manualHeight = false;
     bool m_measurementsVisible = false;
+    bool m_updateQueued = false;
 };
 
 #endif

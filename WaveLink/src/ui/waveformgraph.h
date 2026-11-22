@@ -30,6 +30,7 @@ public:
     void setOfflineSource(qint64 count, ExactReader reader, NearbyReader nearby) { m_sourceRows = count; m_exactReader = std::move(reader); m_nearbyReader = std::move(nearby); }
     void clearOfflineSource() { m_sourceRows = -1; m_exactReader = {}; m_nearbyReader = {}; }
     bool hasOfflineSource() const { return bool(m_exactReader); }
+    double nearestSampleTime(double time) const;
     qint64 sourceSampleCount() const { return hasOfflineSource() ? m_sourceRows : dataCount(); }
     bool readExact(double lower, double upper, int maximum, QVector<QCPGraphData> &points, QString &error, bool newest = false) const {
         if (m_exactReader) return m_exactReader(lower, upper, maximum, points, error, newest);

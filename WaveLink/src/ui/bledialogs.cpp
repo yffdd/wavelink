@@ -69,19 +69,191 @@ QString properties(int p)
     if (p & 32) list << "Indicate";
     return list.join(" | ");
 }
-QString characteristicLabel(const QJsonObject &c)
+QString shortUuid(const QString &value)
 {
-    return QStringLiteral("%1 [#%2] — 服务 %3").arg(c.value("uuid").toString()).arg(c.value("handle").toInt()).arg(c.value("service").toString());
+    const auto s = BleProfileStore::normalizeUuid(value);
+    if (s.endsWith("-0000-1000-8000-00805f9b34fb"))
+        return (s.startsWith("0000") ? s.mid(4, 4) : s.left(8)).toUpper();
+    return s.left(8).toUpper() + QStringLiteral("…") + s.right(4).toUpper();
 }
-QString shortCharacteristicLabel(const QJsonObject &c)
+void addChannelChoice(QComboBox *combo, const QJsonObject &c, bool receive, bool nordic)
 {
-    auto compact = [](const QString &value) {
-        const auto s = BleProfileStore::normalizeUuid(value);
-        return s.endsWith("-0000-1000-8000-00805f9b34fb") ? s.mid(s.startsWith("0000") ? 4 : 0, s.startsWith("0000") ? 4 : 8).toUpper() : s;
-    };
-    return (BleChannelPolicy::firmwareService(c.value("service").toString()) ? QStringLiteral("【固件升级】 ") : QString()) +
-        QStringLiteral("%1 · 服务 %2 · %3").arg(compact(c.value("uuid").toString()), compact(c.value("service").toString()), properties(c.value("properties").toInt()));
+    const QString service = c.value("service").toString(), characteristic = c.value("uuid").toString();
+    const int handle = c.value("handle").toInt(), p = c.value("properties").toInt();
+    const QString label = nordic ? (receive ? QStringLiteral("Nordic UART · 设备发出（TX）") : QStringLiteral("Nordic UART · 设备接收（RX）")) :
+        QStringLiteral("%1%2 · 服务 %3 · #%4")
+            .arg(BleChannelPolicy::firmwareService(service) ? QStringLiteral("【固件升级】 ") : QString(),
+                 shortUuid(characteristic), shortUuid(service)).arg(handle);
+    combo->addItem(label, handle);
+    combo->setItemData(combo->count() - 1, QStringLiteral("特征 UUID：%1\n服务 UUID：%2\n属性：%3\n句柄：#%4")
+        .arg(characteristic, service, properties(p)).arg(handle), Qt::ToolTipRole);
 }
+
+}
+
+GattChannels::GattChannels(const QJsonArray &entries, BleHostClient *client, QWidget *parent,
+                           const std::function<void(int)> &selectRx, const std::function<void(int)> &selectTx,
+                           bool compact)
+    : QWidget(parent)
+{
+    const auto nus = BleChannelPolicy::nordicUart(entries);
+    auto layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+    auto tree = new QTreeWidget;
+    tree->setObjectName(compact ? "bleInlineGattTree" : "bleGattTree");
+    tree->setHeaderLabels(compact ? QStringList{QStringLiteral("BLE 服务与特征")} :
+        QStringList{QStringLiteral("服务 / 特征"), QStringLiteral("操作")});
+    tree->setMinimumHeight(compact ? 210 : 160);
+    tree->setMaximumHeight(230);
+    tree->header()->setStretchLastSection(false);
+    tree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    if (compact) {
+        tree->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        tree->setIndentation(12);
+    } else {
+        tree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    }
+    layout->addWidget(tree);
+    auto output = new QPlainTextEdit;
+    output->setObjectName("bleGattReadResult");
+    output->setReadOnly(true);
+    output->setMaximumHeight(90);
+    output->hide();
+    layout->addWidget(output);
+    tree->setContextMenuPolicy(Qt::ActionsContextMenu);
+    auto copy = new QAction(QStringLiteral("复制完整 UUID"), tree);
+    tree->addAction(copy);
+    connect(copy, &QAction::triggered, this, [tree] {
+        if (auto item = tree->currentItem()) QApplication::clipboard()->setText(item->data(0, Qt::UserRole).toString());
+    });
+    QMap<QPair<int, QString>, QTreeWidgetItem *> services;
+    for (const auto &value : entries) {
+        const auto c = value.toObject();
+        const QString service = c.value("service").toString(), id = c.value("uuid").toString();
+        const int handle = c.value("handle").toInt(), p = c.value("properties").toInt();
+        const bool firmware = BleChannelPolicy::firmwareService(service);
+        const auto key = qMakePair(c.value("serviceHandle").toInt(), service);
+        auto &group = services[key];
+        if (!group) {
+            const QString shortId = shortUuid(service);
+            auto title = shortId;
+            if (uuid(service) == BleProfileStore::nus().value("rxService").toString()) title = QStringLiteral("Nordic UART");
+            else if (shortId == "1800") title = QStringLiteral("通用访问 · 1800");
+            else if (shortId == "1801") title = QStringLiteral("通用属性 · 1801");
+            else if (firmware) title = QStringLiteral("固件升级 · %1").arg(shortId);
+            group = new QTreeWidgetItem(tree, {title});
+            auto font = group->font(0); font.setBold(true); group->setFont(0, font);
+            group->setToolTip(0, service);
+            group->setData(0, Qt::UserRole, service);
+            group->setExpanded(!firmware && shortId != "1800" && shortId != "1801");
+        }
+        if (handle <= 0) {
+            if (compact) group->setText(0, group->text(0) + QStringLiteral(" · 无法访问"));
+            else group->setText(1, QStringLiteral("无法访问"));
+            continue;
+        }
+        const auto title = handle == nus.rx ? QStringLiteral("设备发出（TX）") :
+            handle == nus.tx ? QStringLiteral("设备接收（RX）") : shortUuid(id);
+        auto item = new QTreeWidgetItem(group, {QStringLiteral("%1  ·  #%2").arg(title).arg(handle)});
+        item->setData(0, Qt::UserRole, id);
+        item->setToolTip(0, QStringLiteral("特征 UUID：%1\n服务 UUID：%2\n属性：%3").arg(id, service, properties(p)));
+
+        auto actions = new QWidget(tree->viewport());
+        auto row = new QHBoxLayout;
+        row->setContentsMargins(compact ? 0 : 4, compact ? 0 : 2, compact ? 0 : 4, compact ? 0 : 2);
+        row->setSpacing(4);
+        if (compact) {
+            auto column = new QVBoxLayout(actions);
+            column->setContentsMargins(2, 2, 2, 2);
+            column->setSpacing(2);
+            auto name = new QLabel(item->text(0), actions);
+            name->setObjectName("bleInlineCharacteristicName");
+            name->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+            name->setToolTip(item->toolTip(0));
+            column->addWidget(name);
+            column->addLayout(row);
+        } else {
+            actions->setLayout(row);
+            row->addStretch();
+        }
+        const auto add = [&](const char *name, const QString &text, const QString &tip, bool checkable) {
+            auto button = new QToolButton(actions);
+            button->setObjectName(QString::fromLatin1(name));
+            button->setProperty("gattHandle", handle);
+            button->setText(text);
+            button->setToolTip(tip);
+            button->setCheckable(checkable);
+            const QString border = QStringLiteral("QToolButton:enabled:!checked:!hover { border-color: palette(mid); }");
+            button->setStyleSheet(compact ? QStringLiteral("QToolButton { padding: 2px 5px; margin: 0px; }") + border : border);
+            button->ensurePolished();
+            const auto font = button->fontMetrics();
+            button->setMinimumSize(button->sizeHint().expandedTo(QSize(
+                qMax(compact ? 44 : 72, font.horizontalAdvance(text) + (compact ? 14 : 30)),
+                qMax(compact ? 26 : 32, qMax(font.height(), font.boundingRect(text).height()) + (compact ? 8 : 14)))));
+            row->addWidget(button);
+            return button;
+        };
+        Row controls{handle};
+        if ((p & 2) && client) {
+            controls.read = add("bleGattRead", QStringLiteral("读取"), QStringLiteral("读取一次当前值"), false);
+            connect(controls.read, &QToolButton::clicked, this, [this, client, output, handle] {
+                output->show();
+                reading = client->readCharacteristic(handle);
+                output->setPlainText(reading ? QStringLiteral("正在读取特征 #%1…").arg(handle) : QStringLiteral("连接正在忙，请稍后重试。"));
+                if (refresh) refresh();
+            });
+        }
+        if (p & (16 | 32)) {
+            controls.rx = add("bleGattRx", QStringLiteral("接收"), QStringLiteral("设备 → 电脑。再次点击取消选择。"), true);
+            connect(controls.rx, &QToolButton::clicked, this, [selectRx, handle](bool on) { selectRx(on ? handle : 0); });
+        }
+        if (p & (4 | 8)) {
+            controls.tx = add("bleGattTx", QStringLiteral("发送"), QStringLiteral("电脑 → 设备。再次点击取消选择。"), true);
+            connect(controls.tx, &QToolButton::clicked, this, [selectTx, handle](bool on) { selectTx(on ? handle : 0); });
+        }
+        if (controls.read || controls.rx || controls.tx) {
+            if (compact) {
+                row->addStretch();
+                // The embedded label owns the caption in the compact view.
+                // Keep it available to accessibility without painting it twice.
+                item->setData(0, Qt::AccessibleTextRole, item->text(0));
+                item->setText(0, QString());
+            }
+            // The header and rows size from the item data, even before
+            // Qt has laid out the action widget or expanded this service.
+            const int actionColumn = compact ? 0 : 1;
+            item->setSizeHint(actionColumn, actions->sizeHint());
+            tree->setItemWidget(item, actionColumn, actions);
+        } else {
+            delete actions;
+        }
+        rows.append(controls);
+    }
+    if (client) {
+        connect(client, &BleHostClient::characteristicRead, this, [this, output](int handle, const QByteArray &data) {
+            if (!reading) return;
+            reading = false;
+            output->setPlainText(QStringLiteral("特征 #%1\nHEX: %2\nUTF-8: %3").arg(handle)
+                .arg(QString::fromLatin1(data.toHex(' ')), QString::fromUtf8(data)));
+        });
+        connect(client, &BleHostClient::errorOccurred, this, [this, output](const QString &message) {
+            if (!reading) return;
+            reading = false;
+            output->setPlainText(message);
+        });
+    }
+}
+
+void GattChannels::updateSelection(int rx, int tx, bool edit, bool read)
+{
+    for (const auto &r : rows) {
+        if (r.rx) { r.rx->setChecked(r.handle == rx); r.rx->setEnabled(edit); }
+        if (r.tx) { r.tx->setChecked(r.handle == tx); r.tx->setEnabled(edit); }
+        if (r.read) r.read->setEnabled(read);
+    }
+}
+
+namespace {
 QString profileText(const QJsonObject &profile)
 {
     if (profile.isEmpty()) return QStringLiteral("尚未保存收发配置");
@@ -269,209 +441,387 @@ QJsonObject BleDialogs::selectDevice(BleHostClient *client, QWidget *parent)
     return devices.value(table->item(table->currentRow(), 0)->data(Qt::UserRole).toString());
 }
 
-bool BleDialogs::configure(BleHostClient *client, const QJsonArray &entries,
-                          const QJsonObject &savedProfile, QJsonObject &profile, QWidget *parent, const QString &deviceName)
+bool BleDialogs::confirmSendParameters(QWidget *parent, int packet, int interval)
 {
-    QDialog dialog(parent); prepare(dialog, QStringLiteral("BLE 快速收发配置"), QSize(920, 560));
+    return confirmSendSettings(parent, packet, interval);
+}
+
+bool BleDialogs::confirmByteStream(QWidget *parent)
+{
+    return confirmAction(parent, QStringLiteral("确认 BLE 透传通道"),
+        QStringLiteral("请确认新选的发送通道支持透传字节流。确认后会保存通道并重新连接设备。"));
+}
+
+BleDialogs::ProfileAction BleDialogs::configure(BleHostClient *client, const QJsonArray &entries,
+                                                 QJsonObject active, const QJsonObject &saved, bool editable,
+                                                 QWidget *parent, const QString &deviceName)
+{
+    if (!client) return {};
+    const bool initialSetup = client->state() == BleHostClient::State::AwaitingConfiguration;
+    const bool connectedAtOpen = client->state() == BleHostClient::State::Ready;
+    const bool hasServices = initialSetup || connectedAtOpen;
+    QDialog dialog(parent);
+    dialog.setObjectName("bleConfigurationDialog");
+    prepare(dialog, QStringLiteral("BLE 收发配置"), hasServices ? QSize(920, 560) : QSize(920, 360));
     auto outer = new QVBoxLayout(&dialog);
-    auto heading = new QLabel(deviceName.isEmpty() ? QStringLiteral("选择 BLE 收发通道") : deviceName);
-    heading->setObjectName("bleDeviceHeading"); heading->setTextFormat(Qt::PlainText);
-    auto headingFont = heading->font(); headingFont.setPointSize(headingFont.pointSize() + 3); headingFont.setBold(true); heading->setFont(headingFont);
-    heading->setWordWrap(true); outer->addWidget(heading);
-    auto scroll = new QScrollArea; scroll->setWidgetResizable(true); scroll->setObjectName("bleGattScroll");
-    auto content = new QWidget; auto layout = new QVBoxLayout(content);
-    layout->setContentsMargins(8, 8, 8, 8); layout->setSizeConstraint(QLayout::SetMinAndMaxSize); outer->addWidget(scroll, 1);
-    auto info = new QLabel(QStringLiteral("选择接收/发送通道即可开始；也可以只接收。候选仅依据属性，不会发送探测命令。"));
-    info->setWordWrap(true); layout->addWidget(info);
-    auto candidateRow = new QHBoxLayout;
-    auto candidate = new QComboBox; candidate->setObjectName("bleCandidateChoice"); candidate->setMinimumWidth(0);
-    candidate->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon); candidate->setMinimumContentsLength(16);
-    const auto recommendations = BleChannelPolicy::candidates(entries);
+    auto heading = new QLabel(deviceName.isEmpty() ? QStringLiteral("未选择 BLE 设备") : deviceName);
+    heading->setObjectName("bleDeviceHeading");
+    heading->setTextFormat(Qt::PlainText);
+    auto headingFont = heading->font();
+    headingFont.setPointSize(headingFont.pointSize() + 3);
+    headingFont.setBold(true);
+    heading->setFont(headingFont);
+    heading->setWordWrap(true);
+    outer->addWidget(heading);
+
+    auto scroll = new QScrollArea;
+    scroll->setObjectName("bleGattScroll");
+    scroll->setWidgetResizable(true);
+    outer->addWidget(scroll, 1);
+    auto content = new QWidget;
+    auto body = new QVBoxLayout(content);
+    body->setContentsMargins(8, 8, 8, 8);
+    body->setSizeConstraint(QLayout::SetMinAndMaxSize);
+    auto info = new QLabel(!editable ? QStringLiteral("发送或录制进行中，当前只读。") :
+        initialSetup ? QStringLiteral("选择接收和发送通道，或仅配置一个方向。") :
+        connectedAtOpen ? QStringLiteral("可读取当前值，或为下次连接选择收发通道。") :
+        QStringLiteral("连接设备后可从服务列表选择通道，也可在高级配置中编辑预设。"));
+    info->setWordWrap(true);
+    body->addWidget(info);
+
+    const auto recommendations = hasServices ? BleChannelPolicy::candidates(entries) : QList<BleChannelPolicy::Candidate>();
+    const auto nus = hasServices ? BleChannelPolicy::nordicUart(entries) : BleChannelPolicy::Candidate();
+    auto candidate = new QComboBox(content);
+    candidate->setObjectName("bleCandidateChoice");
+    candidate->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    candidate->setMinimumContentsLength(16);
     for (const auto &c : recommendations) candidate->addItem(c.name);
-    if (recommendations.isEmpty()) candidate->addItem(QStringLiteral("未找到明确候选，请手动选择收发通道"));
-    auto useCandidate = new QPushButton(QStringLiteral("使用候选通道")); useCandidate->setObjectName("bleUseCandidate");
-    auto receiveOnly = new QPushButton(QStringLiteral("仅接收候选通道")); receiveOnly->setObjectName("bleReceiveOnlyCandidate");
-    useCandidate->setToolTip(QStringLiteral("只预选下方通道，不会连接应用或发送数据；请核对外设的通道用途。"));
-    receiveOnly->setToolTip(QStringLiteral("预选候选接收通道并关闭发送；点击应用后订阅通知，不发送业务命令。"));
-    candidateRow->addWidget(candidate, 1); candidateRow->addWidget(useCandidate); candidateRow->addWidget(receiveOnly); layout->addLayout(candidateRow);
-    auto advancedToggle = new QToolButton; advancedToggle->setObjectName("bleGattAdvancedToggle");
-    advancedToggle->setText(QStringLiteral("高级配置 · 服务详情、模板与发送参数")); advancedToggle->setCheckable(true);
-    advancedToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon); advancedToggle->setArrowType(Qt::RightArrow);
-    auto advanced = new QWidget; advanced->setObjectName("bleGattAdvanced"); auto advancedLayout = new QVBoxLayout(advanced);
-    advancedLayout->setContentsMargins(0, 0, 0, 0);
-    auto tree = new QTreeWidget; tree->setHeaderLabels({QStringLiteral("服务 / 特征 UUID（右键可复制）"), QStringLiteral("属性")});
-    tree->setObjectName("bleGattTree"); tree->setMinimumHeight(180); tree->setMaximumHeight(300);
-    tree->setContextMenuPolicy(Qt::ActionsContextMenu);
-    auto copy = new QAction(QStringLiteral("复制 UUID"), tree); tree->addAction(copy);
-    QObject::connect(copy, &QAction::triggered, &dialog, [tree] { if (tree->currentItem()) QApplication::clipboard()->setText(tree->currentItem()->data(0, Qt::UserRole + 1).toString()); });
-    advancedLayout->addWidget(tree);
-    auto form = new QFormLayout; form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    form->setVerticalSpacing(10); form->setRowWrapPolicy(QFormLayout::WrapLongRows);
-    auto rx = new QComboBox; auto tx = new QComboBox; auto mode = new QComboBox;
-    rx->setObjectName("bleReceiveCharacteristic"); tx->setObjectName("bleTransmitCharacteristic"); mode->setObjectName("bleWriteMode");
-    rx->addItem(QStringLiteral("不接收"), 0); tx->addItem(QStringLiteral("不发送"), 0);
-    for (auto combo : {rx, tx}) { combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon); combo->setMinimumContentsLength(16); }
-    mode->addItem(QStringLiteral("有响应写入（优先）"), false); mode->addItem(QStringLiteral("无响应写入（已提交不等于设备确认）"), true);
-    QMap<int, QJsonObject> byHandle; QMap<int, QTreeWidgetItem *> serviceNodes;
-    for (const auto &value : entries) {
-        auto c = value.toObject(); const int serviceHandle = c.value("serviceHandle").toInt();
-        if (!serviceNodes.contains(serviceHandle)) {
-            auto item = new QTreeWidgetItem(tree, {c.value("service").toString(), QString()});
-            item->setData(0, Qt::UserRole + 1, c.value("service").toString()); serviceNodes[serviceHandle] = item;
-        }
-        const int handle = c.value("handle").toInt(), p = c.value("properties").toInt();
-        if (!handle) { serviceNodes[serviceHandle]->setText(1, QStringLiteral("无法访问，请检查配对/权限")); continue; }
-        byHandle[handle] = c;
-        auto item = new QTreeWidgetItem(serviceNodes[serviceHandle], {QStringLiteral("%1 [#%2]").arg(c.value("uuid").toString()).arg(handle), properties(p)});
-        item->setData(0, Qt::UserRole, handle); item->setData(0, Qt::UserRole + 1, c.value("uuid").toString());
-        if (BleChannelPolicy::firmwareService(c.value("service").toString())) item->setText(1, QStringLiteral("【固件升级，勿作普通透传】 ") + properties(p));
-        if (p & (16 | 32)) { rx->addItem(shortCharacteristicLabel(c), handle); rx->setItemData(rx->count() - 1, characteristicLabel(c), Qt::ToolTipRole); }
-        if (p & (4 | 8)) { tx->addItem(shortCharacteristicLabel(c), handle); tx->setItemData(tx->count() - 1, characteristicLabel(c), Qt::ToolTipRole); }
-    }
-    tree->expandAll(); tree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-    auto useRx = new QAction(QStringLiteral("设为电脑接收通道"), tree), useTx = new QAction(QStringLiteral("设为电脑发送通道"), tree);
-    tree->insertAction(copy, useRx); tree->insertAction(copy, useTx);
-    QObject::connect(useRx, &QAction::triggered, &dialog, [=] {
-        if (tree->currentItem()) { const int index = rx->findData(tree->currentItem()->data(0, Qt::UserRole).toInt()); if (index > 0) rx->setCurrentIndex(index); }
-    });
-    QObject::connect(useTx, &QAction::triggered, &dialog, [=] {
-        if (tree->currentItem()) { const int index = tx->findData(tree->currentItem()->data(0, Qt::UserRole).toInt()); if (index > 0) tx->setCurrentIndex(index); }
-    });
-    form->addRow(QStringLiteral("电脑接收（设备 → PC）"), rx); form->addRow(QStringLiteral("电脑发送（PC → 设备）"), tx);
-    layout->addLayout(form);
-    auto modeHint = new QLabel; modeHint->setObjectName("bleAutomaticWriteMode"); modeHint->setWordWrap(true); layout->addWidget(modeHint);
-    auto stream = new QCheckBox(QStringLiteral("确认所选通道用于透传字节流：发送时按实际生效大小分包")); layout->addWidget(stream);
-    stream->setObjectName("bleStreamConfirmation");
-    layout->addWidget(advancedToggle); layout->addWidget(advanced); advanced->hide();
-    QObject::connect(advancedToggle, &QToolButton::toggled, &dialog, [advanced, advancedToggle](bool checked) {
-        advanced->setVisible(checked); advancedToggle->setArrowType(checked ? Qt::DownArrow : Qt::RightArrow);
-    });
-    auto modeForm = new QFormLayout; modeForm->addRow(QStringLiteral("写入模式（自动适配，可调整）"), mode); advancedLayout->addLayout(modeForm);
-    const auto sending = sendControls(&dialog, client); advancedLayout->addWidget(sending.widget);
-    auto read = new QPushButton(QStringLiteral("读取选中特征")); advancedLayout->addWidget(read);
-    auto readValue = new QPlainTextEdit; readValue->setReadOnly(true); readValue->setMaximumHeight(90); advancedLayout->addWidget(readValue); readValue->hide();
-    layout->addStretch();
-    auto reason = new QLabel; reason->setObjectName("bleApplyReason"); reason->setWordWrap(true); outer->addWidget(reason);
-    auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel);
-    buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消并断开"));
-    auto apply = buttons->addButton(QStringLiteral("应用并开始调试"), QDialogButtonBox::AcceptRole); outer->addWidget(buttons);
-    apply->setObjectName("bleApplyConfiguration"); apply->setMinimumHeight(36);
-    apply->setStyleSheet("QPushButton { background:#147dad; color:white; padding:6px 20px; border-radius:4px; } QPushButton:disabled { background:#8799a1; color:#f0f0f0; } QPushButton:hover:enabled { background:#1996cb; }");
-    auto restoreSelection = [&](QComboBox *combo, const QString &service, const QString &characteristic) {
-        if (service.isEmpty() || characteristic.isEmpty()) return;
-        int match = -1, matches = 0;
-        for (int i = 1; i < combo->count(); ++i) {
-            auto c = byHandle.value(combo->itemData(i).toInt());
-            if (uuid(c.value("service").toString()) == uuid(service) && uuid(c.value("uuid").toString()) == uuid(characteristic)) { match = i; ++matches; }
-        }
-        if (matches == 1) combo->setCurrentIndex(match);
-    };
-    auto selectedProfile = [&] {
-        const auto receive = byHandle.value(rx->currentData().toInt()), transmit = byHandle.value(tx->currentData().toInt());
-        QJsonObject p{{"schemaVersion", 3}, {"rxService", receive.value("service").toString()}, {"rxUuid", receive.value("uuid").toString()},
-                          {"txService", transmit.value("service").toString()}, {"txUuid", transmit.value("uuid").toString()}, {"withoutResponse", mode->currentData().toBool()}, {"stream", stream->isChecked()}};
-        sending.insert(p); return p;
-    };
-    auto templates = templateTools(&dialog, selectedProfile, [&](const QJsonObject &p) {
-        rx->setCurrentIndex(0); tx->setCurrentIndex(0);
-        restoreSelection(rx, p.value("rxService").toString(), p.value("rxUuid").toString());
-        restoreSelection(tx, p.value("txService").toString(), p.value("txUuid").toString());
-        mode->setCurrentIndex(p.value("withoutResponse").toBool() ? 1 : 0); stream->setChecked(false);
-        sending.fill(p);
-        info->setText(QStringLiteral("模板只预选唯一匹配的服务/特征；未匹配或重复 UUID 的方向保持未选。请核对属性，并重新确认透传用途。"));
-    }, true);
-    advancedLayout->insertWidget(0, templates);
-    if (!savedProfile.isEmpty()) {
-        restoreSelection(rx, savedProfile.value("rxService").toString(), savedProfile.value("rxUuid").toString());
-        restoreSelection(tx, savedProfile.value("txService").toString(), savedProfile.value("txUuid").toString());
-        mode->setCurrentIndex(savedProfile.value("withoutResponse").toBool() ? 1 : 0);
-        // A manual dialog means legacy/unverified/changed GATT or a parameter
-        // requiring renewed consent. Do not carry send consent into it.
-        stream->setChecked(false);
-        sending.fill(savedProfile);
+    auto useCandidate = new QPushButton(QStringLiteral("使用候选通道"), content);
+    useCandidate->setObjectName("bleUseCandidate");
+    auto receiveOnly = new QPushButton(QStringLiteral("仅接收候选通道"), content);
+    receiveOnly->setObjectName("bleReceiveOnlyCandidate");
+    if (!recommendations.isEmpty()) {
+        auto row = new QHBoxLayout;
+        row->addWidget(candidate, 1);
+        row->addWidget(useCandidate);
+        row->addWidget(receiveOnly);
+        body->addLayout(row);
     } else {
-        // Only a structural NUS match is prefilled. Never choose an arbitrary
-        // write characteristic, or identify a module solely from its name.
-        const QString service = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-        restoreSelection(rx, service, "6e400003-b5a3-f393-e0a9-e50e24dcca9e");
-        restoreSelection(tx, service, "6e400002-b5a3-f393-e0a9-e50e24dcca9e");
+        for (QWidget *widget : QList<QWidget *>{candidate, useCandidate, receiveOnly}) widget->hide();
     }
-    auto selectCandidate = [&](bool onlyReceive) {
-        const int index = candidate->currentIndex(); if (index < 0 || index >= recommendations.size()) return;
-        const auto c = recommendations[index];
-        rx->setCurrentIndex(qMax(0, rx->findData(c.rx))); tx->setCurrentIndex(onlyReceive ? 0 : qMax(0, tx->findData(c.tx)));
+
+    auto advancedToggle = new QToolButton;
+    advancedToggle->setObjectName("bleGattAdvancedToggle");
+    advancedToggle->setText(QStringLiteral("高级配置 · 通道、模板与发送参数"));
+    advancedToggle->setCheckable(true);
+    advancedToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    advancedToggle->setArrowType(Qt::RightArrow);
+    auto advanced = new QWidget(content);
+    auto details = new QVBoxLayout(advanced);
+    details->setContentsMargins(0, 0, 0, 0);
+    auto summary = new QPlainTextEdit;
+    summary->setObjectName("bleProfileSummary");
+    summary->setReadOnly(true);
+    summary->setMaximumHeight(145);
+    summary->setPlainText((connectedAtOpen ? QStringLiteral("当前已确认配置\n") : QStringLiteral("上次保存配置\n")) +
+        profileText(connectedAtOpen ? active : saved));
+    details->addWidget(summary);
+    auto form = new QFormLayout;
+    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+    details->addLayout(form);
+    auto rx = new QComboBox(advanced), tx = new QComboBox(advanced), mode = new QComboBox;
+    rx->setObjectName("bleReceiveCharacteristic");
+    tx->setObjectName("bleTransmitCharacteristic");
+    mode->setObjectName("bleWriteMode");
+    rx->addItem(QStringLiteral("不接收"), 0);
+    tx->addItem(QStringLiteral("不发送"), 0);
+    mode->addItem(QStringLiteral("有响应写入（优先）"), false);
+    mode->addItem(QStringLiteral("无响应写入"), true);
+    QList<QLineEdit *> fields;
+    if (initialSetup) {
+        for (auto combo : {rx, tx}) {
+            combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+            combo->setMinimumContentsLength(16);
+        }
+        form->addRow(QStringLiteral("电脑接收（设备 → PC）"), rx);
+        form->addRow(QStringLiteral("电脑发送（PC → 设备）"), tx);
+    } else {
+        rx->hide();
+        tx->hide();
+        const QStringList labels{QStringLiteral("接收服务 UUID"), QStringLiteral("接收特征 UUID"),
+            QStringLiteral("发送服务 UUID"), QStringLiteral("发送特征 UUID")};
+        const QStringList names{"bleNextRxService", "bleNextRxUuid", "bleNextTxService", "bleNextTxUuid"};
+        for (int i = 0; i < labels.size(); ++i) {
+            auto field = new QLineEdit;
+            field->setObjectName(names[i]);
+            form->addRow(labels[i], field);
+            fields.append(field);
+        }
+    }
+    form->addRow(QStringLiteral("写入模式"), mode);
+    const auto sending = sendControls(&dialog, client);
+    details->addWidget(sending.widget);
+    auto live = new QPushButton(QStringLiteral("仅应用发送参数到当前连接"), advanced);
+    live->setObjectName("bleApplySendSettings");
+    live->setVisible(connectedAtOpen);
+    details->addWidget(live);
+
+    QMap<int, QJsonObject> byHandle;
+    if (hasServices) for (const auto &value : entries) {
+        const auto c = value.toObject();
+        const int handle = c.value("handle").toInt(), props = c.value("properties").toInt();
+        if (handle <= 0) continue;
+        byHandle.insert(handle, c);
+        if (props & (16 | 32)) addChannelChoice(rx, c, true, handle == nus.rx);
+        if (props & (4 | 8)) addChannelChoice(tx, c, false, handle == nus.tx);
+    }
+    auto selection = new QLabel;
+    selection->setWordWrap(true);
+    auto modeHint = new QLabel;
+    modeHint->setObjectName("bleAutomaticWriteMode");
+    modeHint->setWordWrap(true);
+    auto stream = new QCheckBox(QStringLiteral("确认所选发送通道支持透传字节流"));
+    stream->setObjectName("bleStreamConfirmation");
+
+    auto selectChannel = [&](bool receive, int handle) {
+        if (initialSetup) {
+            auto combo = receive ? rx : tx;
+            combo->setCurrentIndex(qMax(0, combo->findData(handle)));
+        } else {
+            const int offset = receive ? 0 : 2;
+            const auto c = byHandle.value(handle);
+            fields[offset]->setText(c.value("service").toString());
+            fields[offset + 1]->setText(c.value("uuid").toString());
+            if (!receive && handle) mode->setCurrentIndex((c.value("properties").toInt() & 8) ? 0 : 1);
+        }
         stream->setChecked(false);
-        info->setText(onlyReceive ? QStringLiteral("已预选仅接收通道。应用后订阅通知，不会发送业务命令；请观察数据是否来自目标通道。") :
-            QStringLiteral("已预选属性匹配候选；不保证是透传通道，请核对设备说明并确认发送用途。"));
     };
-    QObject::connect(useCandidate, &QPushButton::clicked, &dialog, [&] { selectCandidate(false); });
-    QObject::connect(receiveOnly, &QPushButton::clicked, &dialog, [&] { selectCandidate(true); });
-    auto update = [&] {
-        const bool waiting = client->state() == BleHostClient::State::AwaitingConfiguration && !client->readPending();
-        templates->setEnabled(waiting);
-        const auto selected = tree->currentItem();
-        read->setEnabled(waiting && selected && (byHandle.value(selected->data(0, Qt::UserRole).toInt()).value("properties").toInt() & 2));
-        useRx->setEnabled(waiting && selected && rx->findData(selected->data(0, Qt::UserRole).toInt()) > 0);
-        useTx->setEnabled(waiting && selected && tx->findData(selected->data(0, Qt::UserRole).toInt()) > 0);
-        const int p = byHandle.value(tx->currentData().toInt()).value("properties").toInt();
-        const bool writeValid = tx->currentData().toInt() == 0 || (p & (mode->currentData().toBool() ? 4 : 8));
-        const bool supported = client->supportsSendControl() || (sending.packet->value() == 20 && sending.interval->value() == 10);
-        QString why;
-        if (!waiting) why = client->readPending() ? QStringLiteral("正在读取特征，请稍候…") : QStringLiteral("正在配置连接并确认通知订阅，请稍候…");
-        else if (!rx->currentData().toInt() && !tx->currentData().toInt()) why = recommendations.isEmpty() ? QStringLiteral("请选择至少一个接收或发送通道；请按设备说明核对实际用途。") : QStringLiteral("请选择至少一个接收或发送通道；可以先点击“仅接收候选通道”。");
-        else if (!supported) why = QStringLiteral("当前辅助程序仅支持 20 字节 / 10 ms，请在高级配置中恢复兼容设置。");
-        else if (!writeValid) why = QStringLiteral("所选发送特征不支持此写入模式，请在高级配置中调整。");
-        else if (tx->currentData().toInt() && !stream->isChecked()) why = QStringLiteral("请勾选透传用途确认；若只需要接收，请将发送通道设为“不发送”。");
-        apply->setEnabled(waiting && why.isEmpty());
-        reason->setText(why.isEmpty() ? QStringLiteral("配置就绪。成功后会记住此设备，服务未变化且参数无需风险确认时可快捷连接；不会自动发送业务命令。") : why);
-        reason->setStyleSheet(waiting && !why.isEmpty() ? "color:#d04b36;" : QString());
-        apply->setToolTip(reason->text());
-        const bool firmware = BleChannelPolicy::firmwareService(byHandle.value(rx->currentData().toInt()).value("service").toString()) || BleChannelPolicy::firmwareService(byHandle.value(tx->currentData().toInt()).value("service").toString());
-        if (firmware) { reason->setText(QStringLiteral("警告：已选择固件升级服务，不建议用于普通收发；建议改选数据服务。") + "\n" + reason->text()); reason->setStyleSheet("color:#d04b36;"); }
-        modeHint->setText(tx->currentData().toInt() ? QStringLiteral("发送方式：%1（按特征自动选择，可在高级配置中调整）").arg(mode->currentText()) : QStringLiteral("当前不启用发送；只接收时无需透传发送确认。"));
-        stream->setVisible(tx->currentData().toInt() != 0);
-        useCandidate->setEnabled(waiting && !recommendations.isEmpty()); receiveOnly->setEnabled(waiting && !recommendations.isEmpty()); candidate->setEnabled(waiting && !recommendations.isEmpty());
-        for (auto combo : {rx, tx, mode}) combo->setEnabled(waiting);
-        stream->setEnabled(waiting);
-        sending.widget->setEnabled(waiting);
-        rx->setToolTip(characteristicLabel(byHandle.value(rx->currentData().toInt())));
-        tx->setToolTip(characteristicLabel(byHandle.value(tx->currentData().toInt())));
-    };
-    QObject::connect(tree, &QTreeWidget::itemSelectionChanged, &dialog, update);
-    QObject::connect(tx, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [&] {
-        stream->setChecked(false); // Confirmation belongs to the selected send channel.
-        const int p = byHandle.value(tx->currentData().toInt()).value("properties").toInt();
-        if (p & 8) mode->setCurrentIndex(0);
-        else if (p & 4) mode->setCurrentIndex(1);
+    auto channels = new GattChannels(hasServices ? entries : QJsonArray(), client, content,
+        [&](int handle) { selectChannel(true, handle); }, [&](int handle) { selectChannel(false, handle); });
+    channels->setVisible(hasServices);
+    body->addWidget(channels);
+    body->addWidget(selection);
+    body->addWidget(modeHint);
+    body->addWidget(stream);
+    body->addWidget(advancedToggle);
+    body->addWidget(advanced);
+    advanced->hide();
+    body->addStretch();
+    QObject::connect(advancedToggle, &QToolButton::toggled, &dialog, [advanced, advancedToggle](bool on) {
+        advanced->setVisible(on);
+        advancedToggle->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
     });
-    for (auto combo : {rx, tx, mode}) QObject::connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, update);
+
+    const auto handles = [&]() -> QPair<int, int> {
+        if (initialSetup) return {rx->currentData().toInt(), tx->currentData().toInt()};
+        if (!connectedAtOpen) return {};
+        return {BleChannelPolicy::resolve(entries, fields[0]->text(), fields[1]->text(), 16 | 32),
+            BleChannelPolicy::resolve(entries, fields[2]->text(), fields[3]->text(), 4 | 8)};
+    };
+    const auto selectedProfile = [&] {
+        const auto chosen = handles();
+        const auto receive = byHandle.value(chosen.first), transmit = byHandle.value(chosen.second);
+        const bool known = nus.tx && chosen == qMakePair(nus.rx, nus.tx);
+        QJsonObject profile{{"schemaVersion", 3}, {"withoutResponse", mode->currentData().toBool()},
+            {"rxService", initialSetup ? receive.value("service").toString() : fields[0]->text()},
+            {"rxUuid", initialSetup ? receive.value("uuid").toString() : fields[1]->text()},
+            {"txService", initialSetup ? transmit.value("service").toString() : fields[2]->text()},
+            {"txUuid", initialSetup ? transmit.value("uuid").toString() : fields[3]->text()}};
+        profile["stream"] = !profile.value("txUuid").toString().isEmpty() && (known || stream->isChecked());
+        sending.insert(profile);
+        return profile;
+    };
+    const auto fill = [&](const QJsonObject &profile) {
+        if (initialSetup) {
+            rx->setCurrentIndex(qMax(0, rx->findData(BleChannelPolicy::resolve(entries,
+                profile.value("rxService").toString(), profile.value("rxUuid").toString(), 16 | 32))));
+            tx->setCurrentIndex(qMax(0, tx->findData(BleChannelPolicy::resolve(entries,
+                profile.value("txService").toString(), profile.value("txUuid").toString(), 4 | 8))));
+        } else {
+            fields[0]->setText(profile.value("rxService").toString());
+            fields[1]->setText(profile.value("rxUuid").toString());
+            fields[2]->setText(profile.value("txService").toString());
+            fields[3]->setText(profile.value("txUuid").toString());
+        }
+        bool withoutResponse = profile.value("withoutResponse").toBool();
+        const int props = byHandle.value(tx->currentData().toInt()).value("properties").toInt();
+        if (initialSetup && props && !(props & (withoutResponse ? 4 : 8))) withoutResponse = !(props & 8);
+        mode->setCurrentIndex(withoutResponse ? 1 : 0);
+        stream->setChecked(!initialSetup && profile.value("stream").toBool());
+        sending.fill(profile);
+    };
+    auto templates = templateTools(&dialog, selectedProfile, fill, editable);
+    details->insertWidget(1, templates);
+    const auto draft = connectedAtOpen && (saved.isEmpty() || !editable) ? active : saved;
+    fill(initialSetup && draft.isEmpty() && nus.tx ? BleProfileStore::nus() : draft);
+
+    auto reason = new QLabel;
+    reason->setObjectName("bleApplyReason");
+    reason->setWordWrap(true);
+    outer->addWidget(reason);
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Cancel)->setText(initialSetup ? QStringLiteral("取消并断开") : QStringLiteral("关闭（不保存）"));
+    outer->addWidget(buttons);
+    QPushButton *apply = nullptr, *save = nullptr, *reconnect = nullptr;
+    if (initialSetup) {
+        apply = buttons->addButton(QStringLiteral("应用并连接"), QDialogButtonBox::AcceptRole);
+        apply->setObjectName("bleApplyConfiguration");
+        apply->setMinimumHeight(36);
+        apply->setStyleSheet("QPushButton { background:#147dad; color:white; padding:6px 20px; border-radius:4px; }"
+                             "QPushButton:disabled { background:#8799a1; color:#f0f0f0; } QPushButton:hover:enabled { background:#1996cb; }");
+    }
+    save = buttons->addButton(QStringLiteral("保存供下次连接"), QDialogButtonBox::ActionRole);
+    save->setObjectName("bleSaveNextProfile");
+    if (connectedAtOpen) {
+        reconnect = buttons->addButton(QStringLiteral("保存并重新连接…"), QDialogButtonBox::ActionRole);
+        reconnect->setObjectName("bleSaveAndReconnect");
+    }
+    const auto canEdit = [&] {
+        return editable && !client->readPending() && !client->sendBusy() &&
+            (!initialSetup || client->state() == BleHostClient::State::AwaitingConfiguration);
+    };
+    const auto update = [&] {
+        const bool connected = client->state() == BleHostClient::State::Ready;
+        const bool editing = canEdit();
+        const bool liveChannels = initialSetup || connected;
+        const auto chosen = handles();
+        const bool known = nus.tx && chosen == qMakePair(nus.rx, nus.tx);
+        const bool hasTx = initialSetup ? chosen.second != 0 : !fields[3]->text().trimmed().isEmpty();
+        const auto label = [](const QString &id) {
+            return BleProfileStore::normalizeUuid(id).isEmpty() ? QStringLiteral("未选") : shortUuid(id);
+        };
+        const auto shortProfile = [&](const QJsonObject &profile) {
+            return QStringLiteral("接收 %1  /  发送 %2").arg(label(profile.value("rxUuid").toString()), label(profile.value("txUuid").toString()));
+        };
+        selection->setText(initialSetup
+            ? QStringLiteral("已选 · 接收 %1  /  发送 %2").arg(chosen.first ? rx->currentText() : QStringLiteral("未选"),
+                chosen.second ? tx->currentText() : QStringLiteral("未选"))
+            : (connected ? QStringLiteral("当前连接 · %1\n").arg(shortProfile(active)) : QString()) +
+                QStringLiteral("下次连接 · %1").arg(shortProfile(selectedProfile())));
+        modeHint->setText(known ? QStringLiteral("已识别 Nordic UART 透传 · %1").arg(mode->currentText()) :
+            initialSetup && hasTx ? QStringLiteral("发送方式：%1").arg(mode->currentText()) : QString());
+        modeHint->setVisible(!modeHint->text().isEmpty());
+        stream->setVisible(hasTx && !known);
+        for (auto field : fields) field->setReadOnly(!editing);
+        for (auto combo : {rx, tx, mode}) combo->setEnabled(editing);
+        for (auto combo : {rx, tx}) combo->setToolTip(combo->currentData(Qt::ToolTipRole).toString());
+        templates->setEnabled(editing);
+        sending.widget->setEnabled(editing);
+        stream->setEnabled(editing);
+        channels->updateSelection(chosen.first, chosen.second, editing && liveChannels, editing && liveChannels);
+        for (QWidget *widget : QList<QWidget *>{candidate, useCandidate, receiveOnly}) widget->setEnabled(editing && liveChannels);
+        live->setEnabled(editing && connected && client->supportsSendControl() && !active.value("txUuid").toString().isEmpty());
+        if (reconnect) reconnect->setEnabled(editing && connected);
+
+        QString why;
+        if (client->readPending()) why = QStringLiteral("正在读取特征，请稍候…");
+        else if (initialSetup && !editing) why = QStringLiteral("正在应用收发配置…");
+        else if (initialSetup && !chosen.first && !chosen.second) why = QStringLiteral("请选择至少一个接收或发送通道。");
+        else if (initialSetup && !client->supportsSendControl() && (sending.packet->value() != 20 || sending.interval->value() != 10))
+            why = QStringLiteral("当前辅助程序仅支持 20 字节 / 10 ms，请在高级配置中恢复兼容设置。");
+        else if (initialSetup && hasTx && !(byHandle.value(chosen.second).value("properties").toInt() & (mode->currentData().toBool() ? 4 : 8)))
+            why = QStringLiteral("所选发送特征不支持此写入模式，请在高级配置中调整。");
+        else if (initialSetup && hasTx && !known && !stream->isChecked()) why = QStringLiteral("请勾选透传用途确认，或取消选择发送通道。");
+        if (apply) apply->setEnabled(editing && why.isEmpty());
+        save->setEnabled(editing && (!initialSetup || why.isEmpty()));
+        const bool firmware = BleChannelPolicy::firmwareService(byHandle.value(chosen.first).value("service").toString()) ||
+            BleChannelPolicy::firmwareService(byHandle.value(chosen.second).value("service").toString());
+        reason->setText(firmware ? QStringLiteral("已选择固件升级服务，请核对用途。 ") + why : why);
+        reason->setStyleSheet(firmware || (editing && !why.isEmpty()) ? "color:#d04b36;" : QString());
+        reason->setVisible(!reason->text().isEmpty());
+    };
+    channels->refresh = update;
+    const auto chooseCandidate = [&](bool receiveOnly) {
+        const int index = candidate->currentIndex();
+        if (index < 0 || index >= recommendations.size()) return;
+        selectChannel(true, recommendations[index].rx);
+        selectChannel(false, receiveOnly ? 0 : recommendations[index].tx);
+        update();
+    };
+    QObject::connect(useCandidate, &QPushButton::clicked, &dialog, [&] { chooseCandidate(false); });
+    QObject::connect(receiveOnly, &QPushButton::clicked, &dialog, [&] { chooseCandidate(true); });
+    QObject::connect(rx, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [&] { stream->setChecked(false); update(); });
+    QObject::connect(tx, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [&] {
+        stream->setChecked(false);
+        const int props = byHandle.value(tx->currentData().toInt()).value("properties").toInt();
+        if (props & (4 | 8)) mode->setCurrentIndex((props & 8) ? 0 : 1);
+        update();
+    });
+    for (auto field : fields) QObject::connect(field, &QLineEdit::textChanged, &dialog, [&] { stream->setChecked(false); update(); });
+    QObject::connect(mode, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, update);
     QObject::connect(stream, &QCheckBox::toggled, &dialog, update);
     QObject::connect(sending.packet, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, update);
     QObject::connect(sending.interval, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, update);
-    QObject::connect(read, &QPushButton::clicked, &dialog, [&] { readValue->show(); if (tree->currentItem()) client->readCharacteristic(tree->currentItem()->data(0, Qt::UserRole).toInt()); update(); });
-    QObject::connect(client, &BleHostClient::characteristicRead, &dialog, [&](int handle, const QByteArray &data) { readValue->setPlainText(QStringLiteral("特征 #%1\nHEX: %2\nUTF-8: %3").arg(handle).arg(QString::fromLatin1(data.toHex(' ')), QString::fromUtf8(data))); });
     QObject::connect(client, &BleHostClient::operationFinished, &dialog, update);
-    QObject::connect(client, &BleHostClient::stateChanged, &dialog, update);
-    QObject::connect(client, &BleHostClient::errorOccurred, &dialog, [&](const QString &message, bool fatal) { advancedToggle->setChecked(true); readValue->show(); readValue->setPlainText(message); if (fatal) dialog.reject(); else update(); });
-    QObject::connect(client, &BleHostClient::ready, &dialog, &QDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    QObject::connect(apply, &QPushButton::clicked, &dialog, [&] {
-        if (tx->currentData().toInt() && !confirmSendSettings(&dialog, sending.packet->value(), sending.interval->value())) return;
-        if (client->configure(rx->currentData().toInt(), tx->currentData().toInt(), mode->currentData().toBool(), sending.packet->value(), sending.interval->value(), true))
-            info->setText(QStringLiteral("正在配置收发通道并等待订阅确认…"));
+
+    ProfileAction result;
+    QJsonObject submitted;
+    bool applyingLive = false;
+    QObject::connect(client, &BleHostClient::stateChanged, &dialog, [&] {
+        if (client->state() == BleHostClient::State::Idle) {
+            if (initialSetup || applyingLive) { dialog.reject(); return; }
+            if (connectedAtOpen) {
+                info->setText(QStringLiteral("连接已结束，可保存配置供下次连接使用。"));
+                summary->setPlainText(QStringLiteral("上次确认配置（连接已结束）\n") + profileText(active));
+            }
+        }
         update();
     });
-    // Install the completed content, so Qt 5 accounts for every nested form
-    // row when calculating scroll extents and showing child controls.
+    QObject::connect(client, &BleHostClient::errorOccurred, &dialog, [&](const QString &message, bool fatal) {
+        applyingLive = false;
+        if (fatal && initialSetup) dialog.reject();
+        else { info->setText(message); update(); }
+    });
+    if (apply) {
+        QObject::connect(client, &BleHostClient::ready, &dialog, [&] {
+            if (submitted.isEmpty()) return;
+            result = {ProfileAction::Applied, submitted};
+            dialog.accept();
+        });
+        QObject::connect(apply, &QPushButton::clicked, &dialog, [&] {
+            const auto chosen = handles();
+            if (chosen.second && !confirmSendSettings(&dialog, sending.packet->value(), sending.interval->value())) return;
+            if (!canEdit()) return;
+            QString error;
+            if (!BleProfileStore::normalize(selectedProfile(), submitted, error)) { info->setText(error); return; }
+            if (!client->configure(chosen.first, chosen.second, mode->currentData().toBool(),
+                                   sending.packet->value(), sending.interval->value(), true)) submitted = {};
+            update();
+        });
+    }
+    const auto saveProfile = [&](bool reconnectNow) {
+        QJsonObject profile;
+        QString error;
+        if (!BleProfileStore::normalize(selectedProfile(), profile, error)) {
+            QMessageBox::warning(&dialog, QStringLiteral("配置未保存"), error);
+            return;
+        }
+        if (reconnectNow && !confirmAction(&dialog, QStringLiteral("重新连接并核对配置？"),
+                                          QStringLiteral("将重新发现设备服务，并使用刚保存的通道重新连接。"))) return;
+        if (!canEdit()) return;
+        result = {reconnectNow && client->state() == BleHostClient::State::Ready ? ProfileAction::Reconnect : ProfileAction::SaveNext, profile};
+        dialog.accept();
+    };
+    QObject::connect(save, &QPushButton::clicked, &dialog, [&] { saveProfile(false); });
+    if (reconnect) QObject::connect(reconnect, &QPushButton::clicked, &dialog, [&] { saveProfile(true); });
+    QObject::connect(live, &QPushButton::clicked, &dialog, [&] {
+        if (!confirmSendSettings(&dialog, sending.packet->value(), sending.interval->value()) || !canEdit()) return;
+        applyingLive = client->applySendSettings(sending.packet->value(), sending.interval->value(), true);
+        info->setText(applyingLive ? QStringLiteral("正在应用发送参数…") : QStringLiteral("连接状态已变化，请稍后重试。"));
+        update();
+    });
+    QObject::connect(client, &BleHostClient::sendSettingsApplied, &dialog, [&] {
+        if (!applyingLive) return;
+        result.kind = ProfileAction::SendSettingsApplied;
+        dialog.accept();
+    });
     scroll->setWidget(content);
-    const int initialProperties = byHandle.value(tx->currentData().toInt()).value("properties").toInt();
-    if (tx->currentData().toInt() && !(initialProperties & (mode->currentData().toBool() ? 4 : 8)))
-        mode->setCurrentIndex((initialProperties & 8) ? 0 : 1);
     update();
-    if (dialog.exec() != QDialog::Accepted || client->state() != BleHostClient::State::Ready) return false;
-    QString error; if (!BleProfileStore::normalize(selectedProfile(), profile, error)) return false;
-    return true;
+    return dialog.exec() == QDialog::Accepted ? result : ProfileAction();
 }
+
 void BleDialogs::showError(const QString &message, const QString &device, QWidget *parent)
 {
     QDialog dialog(parent); prepare(dialog, QStringLiteral("BLE 通信异常"), QSize(720, 460));
@@ -510,103 +860,6 @@ void BleDialogs::showFileError(const QString &message, QWidget *parent)
     QObject::connect(copy, &QPushButton::clicked, &dialog, [text] { QApplication::clipboard()->setText(text->toPlainText()); });
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     layout->addWidget(buttons); dialog.exec();
-}
-BleDialogs::ProfileAction BleDialogs::manageProfiles(const QJsonObject &active, const QJsonObject &next,
-                                                     const QJsonArray &entries, bool ready, bool editable, QWidget *parent, BleHostClient *client)
-{
-    QDialog dialog(parent); prepare(dialog, QStringLiteral("BLE 收发配置与模板"), QSize(850, 680));
-    auto layout = new QVBoxLayout(&dialog);
-    auto scroll = new QScrollArea; scroll->setWidgetResizable(true); auto content = new QWidget;
-    auto body = new QVBoxLayout(content); body->setSizeConstraint(QLayout::SetMinAndMaxSize); layout->addWidget(scroll, 1);
-    auto info = new QLabel(ready ? QStringLiteral("UUID/写入模式只保存给下次连接，不在线替换订阅。高级发送参数可在发送空闲时单独应用到当前连接。") : QStringLiteral("保存配置尚未与本次实际设备核对；连接后仍需发现服务并确认。"));
-    if (!editable) info->setText(QStringLiteral("发送、录制或连接操作进行中：只读查看，不修改当前或下次连接配置。"));
-    info->setWordWrap(true); body->addWidget(info);
-    auto currentText = new QPlainTextEdit; currentText->setObjectName("bleProfileSummary"); currentText->setReadOnly(true); currentText->setMaximumHeight(145);
-    QString summary = (ready ? QStringLiteral("当前已确认配置\n") : QStringLiteral("上次保存配置（未核对）\n")) + profileText(ready ? active : next);
-    if (!entries.isEmpty()) {
-        summary += QStringLiteral("\n\n上次发现的服务/特征（句柄只在当次连接有效）\n");
-        for (const auto &v : entries) { const auto c = v.toObject(); summary += characteristicLabel(c) + " " + properties(c.value("properties").toInt()) + "\n"; }
-    }
-    currentText->setPlainText(summary); body->addWidget(currentText);
-    auto form = new QFormLayout; form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    QList<QLineEdit *> fields;
-    for (const auto label : {QStringLiteral("接收服务 UUID"), QStringLiteral("接收特征 UUID"), QStringLiteral("发送服务 UUID"), QStringLiteral("发送特征 UUID")}) {
-        auto field = new QLineEdit; field->setMinimumWidth(0); form->addRow(label, field); fields.append(field);
-    }
-    fields[0]->setObjectName("bleNextRxService"); fields[1]->setObjectName("bleNextRxUuid"); fields[2]->setObjectName("bleNextTxService"); fields[3]->setObjectName("bleNextTxUuid");
-    auto mode = new QComboBox; mode->addItems({QStringLiteral("有响应写入"), QStringLiteral("无响应写入")}); form->addRow(QStringLiteral("下次写入模式"), mode);
-    auto stream = new QCheckBox(QStringLiteral("透传字节流（实际连接时仍需核对用途）")); form->addRow(stream);
-    const auto sending = sendControls(&dialog, client);
-    auto fill = [fields, mode, stream, sending](const QJsonObject &profile) {
-        fields[0]->setText(profile.value("rxService").toString()); fields[1]->setText(profile.value("rxUuid").toString());
-        fields[2]->setText(profile.value("txService").toString()); fields[3]->setText(profile.value("txUuid").toString());
-        mode->setCurrentIndex(profile.value("withoutResponse").toBool() ? 1 : 0); stream->setChecked(profile.value("stream").toBool());
-        sending.fill(profile);
-    };
-    auto value = [fields, mode, stream, sending] {
-        QJsonObject p{{"schemaVersion", 3}, {"rxService", fields[0]->text()}, {"rxUuid", fields[1]->text()},
-            {"txService", fields[2]->text()}, {"txUuid", fields[3]->text()}, {"withoutResponse", mode->currentIndex() == 1}, {"stream", stream->isChecked()}};
-        sending.insert(p); return p;
-    };
-    fill(!editable && ready ? active : next);
-    body->addWidget(templateTools(&dialog, value, fill, editable)); body->addLayout(form);
-    for (auto field : fields) field->setReadOnly(!editable); mode->setEnabled(editable); stream->setEnabled(editable);
-    body->addWidget(sending.widget); sending.widget->setEnabled(editable);
-    auto limits = new QLabel(QStringLiteral("UUID 可填 16/32 位短格式或完整格式。接收或发送不用时，将该方向两项同时留空。模板保存设置值，不保存协商 MTU 或提速授权。"));
-    limits->setWordWrap(true); body->addWidget(limits); body->addStretch();
-    auto buttons = new QDialogButtonBox(QDialogButtonBox::Close); buttons->button(QDialogButtonBox::Close)->setText(QStringLiteral("关闭（不保存）")); layout->addWidget(buttons);
-    ProfileAction result;
-    auto save = buttons->addButton(QStringLiteral("保存供下次连接"), QDialogButtonBox::ActionRole); save->setObjectName("bleSaveNextProfile"); save->setEnabled(editable);
-    auto reconnect = buttons->addButton(QStringLiteral("保存并重新连接…"), QDialogButtonBox::ActionRole); reconnect->setEnabled(editable && ready);
-    auto live = new QPushButton(QStringLiteral("仅应用发送参数到当前连接")); live->setObjectName("bleApplySendSettings"); body->insertWidget(body->count() - 1, live);
-    bool applying = false;
-    auto updateLive = [&] {
-        const bool connected = client && client->state() == BleHostClient::State::Ready;
-        const bool canEdit = editable && !applying && (!client || (!client->sendBusy() && !client->readPending()));
-        live->setEnabled(canEdit && connected && client->supportsSendControl() && !active.value("txUuid").toString().isEmpty());
-        sending.widget->setEnabled(canEdit); save->setEnabled(canEdit); reconnect->setEnabled(canEdit && connected);
-    };
-    if (client) {
-        QObject::connect(client, &BleHostClient::operationFinished, &dialog, updateLive);
-        QObject::connect(client, &BleHostClient::stateChanged, &dialog, [&] {
-            if (applying && client->state() != BleHostClient::State::Ready) dialog.reject();
-            else {
-                if (ready && client->state() != BleHostClient::State::Ready) {
-                    info->setText(QStringLiteral("连接已结束，当前参数不再生效；保存只用于下次连接，不会自动重连。"));
-                    currentText->setPlainText(QStringLiteral("上次确认配置（连接已结束）\n") + profileText(active));
-                }
-                updateLive();
-            }
-        });
-        QObject::connect(client, &BleHostClient::sendSettingsApplied, &dialog, [&] {
-            if (!applying) return;
-            result.applyCurrent = true; result.profile = active; result.profile["schemaVersion"] = 3;
-            const auto s = client->sendSettings(); result.profile["packetSize"] = s.value("packetSize"); result.profile["intervalMs"] = s.value("intervalMs"); dialog.accept();
-        });
-        QObject::connect(client, &BleHostClient::errorOccurred, &dialog, [&](const QString &message, bool fatal) {
-            if (applying) { applying = false; info->setText(message); if (fatal) dialog.reject(); else updateLive(); }
-        });
-    }
-    QObject::connect(live, &QPushButton::clicked, &dialog, [&] {
-        if (!client || !confirmSendSettings(&dialog, sending.packet->value(), sending.interval->value())) return;
-        // Recheck after the modal confirmation: disconnect/queued commands may
-        // have occurred while the user was deciding.
-        if (client->applySendSettings(sending.packet->value(), sending.interval->value(), true)) { applying = true; info->setText(QStringLiteral("等待辅助程序确认发送参数…")); }
-        else info->setText(QStringLiteral("发送参数未应用：连接状态已变化或发送尚未空闲，请稍后再试。"));
-        updateLive();
-    });
-    auto accept = [&](bool reconnectNow) {
-        QString error; QJsonObject profile;
-        if (!BleProfileStore::normalize(value(), profile, error)) { QMessageBox::warning(&dialog, QStringLiteral("配置未保存"), error); return; }
-        if (reconnectNow && !confirmAction(&dialog, QStringLiteral("重新连接并核对配置？"), QStringLiteral("将断开当前连接，重新发现服务并由你确认收发特征。不会自动发送命令或重新启动录制。"))) return;
-        result.saveNext = true; result.reconnect = reconnectNow; result.profile = profile; dialog.accept();
-    };
-    QObject::connect(save, &QPushButton::clicked, &dialog, [&] { accept(false); });
-    QObject::connect(reconnect, &QPushButton::clicked, &dialog, [&] { accept(true); });
-    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    scroll->setWidget(content); updateLive();
-    if (dialog.exec() != QDialog::Accepted) return {};
-    return result;
 }
 void BleDialogs::showDiagnostics(const std::function<QString(bool)> &snapshot, QWidget *parent)
 {

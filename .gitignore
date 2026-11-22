@@ -40,6 +40,7 @@ CMakeLists.txt.user*
 .qmake.stash
 
 # Installer output and local publishing configuration
+/deploy/.ble-cache/
 /deploy/setup/_Setup_Work/
 /deploy/setup/WaveLink_Release/
 /deploy/setup/latest.json

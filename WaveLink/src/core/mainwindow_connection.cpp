@@ -14,6 +14,7 @@
 #include "helpdialog.h"
 #include <QSerialPortInfo>
 #include <QMessageBox>
+#include <QDialog>
 #include <QDockWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -52,6 +53,7 @@
 #include <QClipboard>
 #include <QApplication>
 #include <QSaveFile>
+#include <algorithm>
 
 void MainWindow::onRefreshPorts()
 {
@@ -85,7 +87,7 @@ void MainWindow::onRefreshPorts()
 void MainWindow::onInterfaceChanged(int row)
 {
     stopConsolePeriodicSend("数据接口已切换，定时发送已停止。");
-    m_receiveDecoder.reset(); m_receiveDecoderEncoding.clear();
+    resetReceiveTextDecoder();
     if (row < 0 || !comboInterface->itemData(row).isValid()) return;
     const int index = comboInterface->itemData(row).toInt();
     // Persistent IDs and page indices remain stable, independent of display order.
@@ -133,7 +135,10 @@ void MainWindow::setConnectionState(ConnectionState state, int interfaceType)
     switch (state) {
     case ConnectionState::Disconnected: stateText = QStringLiteral("未连接"); break;
     case ConnectionState::Connecting: stateText = QStringLiteral("正在连接"); break;
-    case ConnectionState::Connected: stateText = interfaceType == 5 ? QStringLiteral("UDP 监听中（不代表远端在线）") : QStringLiteral("已连接"); break;
+    case ConnectionState::Connected:
+        stateText = interfaceType == 2 ? QStringLiteral("TCP 监听中，等待设备连接")
+            : interfaceType == 5 ? QStringLiteral("UDP 监听中（不代表远端在线）") : QStringLiteral("已连接");
+        break;
     case ConnectionState::Disconnecting: stateText = QStringLiteral("正在断开"); break;
     case ConnectionState::Error: stateText = QStringLiteral("连接异常"); break;
     }
@@ -382,7 +387,7 @@ void MainWindow::handleRecordingError(const QString &errorMsg)
 
 void MainWindow::finishConnectionOpen(int interfaceType)
 {
-    m_receiveDecoder.reset(); m_receiveDecoderEncoding.clear();
+    resetReceiveTextDecoder();
     if (m_isImportedData) {
         onClearPlots();
         clearFilterSelections();
@@ -413,7 +418,7 @@ void MainWindow::finishConnectionOpen(int interfaceType)
     comboParity->setEnabled(false);
     comboStopBits->setEnabled(false);
     comboFlowControl->setEnabled(false);
-    comboProtocol->setEnabled(true);
+    comboProtocol->setEnabled(interfaceType != 3);
     editIP->setEnabled(false);
     spinPort->setEnabled(false);
     spinServerPort->setEnabled(false);
@@ -446,6 +451,13 @@ void MainWindow::finishConnectionOpen(int interfaceType)
 void MainWindow::finishConnectionClosed(int interfaceType, bool clearPendingData)
 {
     const bool hadBreak = m_serialBreakActive || m_serialBreakPending;
+    if (interfaceType == 2) {
+        m_tcpServerSendSession = 0;
+        m_tcpServerWaitReason.clear();
+        if (m_tcpServerPeerNotice) m_tcpServerPeerNotice->close();
+        lblServerConnCount->setText(QStringLiteral("0"));
+        lblServerCurrentConn->setText(QStringLiteral("无"));
+    }
     m_serialSendCancelPending = false;
     m_serialFlowControl = 0;
     m_serialBreakActive = m_serialBreakPulse = m_serialBreakPending = m_serialBreakSupported = false;
@@ -501,7 +513,7 @@ void MainWindow::finishConnectionClosed(int interfaceType, bool clearPendingData
         chkDtr->setAccessibleDescription(QStringLiteral("下次打开串口时应用此设置"));
         chkRts->setAccessibleDescription(QStringLiteral("下次打开串口时应用此设置"));
     }
-    comboProtocol->setEnabled(true);
+    comboProtocol->setEnabled(interfaceType != 3);
     editIP->setEnabled(true);
     spinPort->setEnabled(true);
     spinServerPort->setEnabled(true);
@@ -511,35 +523,84 @@ void MainWindow::finishConnectionClosed(int interfaceType, bool clearPendingData
 void MainWindow::onClearReceive()
 {
     textReceive->clear();
-    receiveTextBuffer.clear();
-    m_receiveDecoder.reset(); m_receiveDecoderEncoding.clear();
+    m_pendingReceiveText.clear();
+    m_hasTransmitEcho = false;
+    resetReceiveTextDecoder();
 }
-void MainWindow::appendReceiveText(const QString &text)
+void MainWindow::resetReceiveTextDecoder()
 {
-    receiveTextBuffer.append(text);
-    ReceiveConsoleBuffer::trimPending(receiveTextBuffer, chkHexReceive->isChecked(),
-        m_systemPreferences.receiveLines, m_systemPreferences.receiveCharacters);
+    m_receiveDecoder.reset();
+    m_receiveDecoderEncoding.clear();
+    m_receiveAnsiColors.reset();
+}
+void MainWindow::appendReceiveText(const QString &text, const QString &prefix, bool colorize)
+{
+    bool hasText = false;
+    bool endsWithNewline = false;
+    const auto append = [&](const QStringRef &part, const QTextCharFormat &format) {
+        if (part.isEmpty()) return;
+        if (!hasText) m_pendingReceiveText.append(prefix.midRef(0));
+        m_pendingReceiveText.append(part, format);
+        hasText = true;
+        endsWithNewline = part.endsWith('\n');
+    };
+    if (colorize) m_receiveAnsiColors.parse(text, append);
+    else append(text.midRef(0), QTextCharFormat());
+    if (!hasText) return;
+    if (!prefix.isEmpty() && !endsWithNewline) {
+        const QString newline = QStringLiteral("\n");
+        m_pendingReceiveText.append(newline.midRef(0));
+    }
+    m_pendingReceiveText.trim(chkHexReceive->isChecked(), m_systemPreferences.receiveLines, m_systemPreferences.receiveCharacters);
+}
+void MainWindow::appendTransmitEcho(const QByteArray &data, bool hex)
+{
+    if (!chkShowTransmitData->isChecked() || data.isEmpty()) return;
+
+    hex = hex || chkHexReceive->isChecked();
+    QString text;
+    if (!hex) {
+        text = QString::fromUtf8(data.constData(), data.size());
+        hex = text.toUtf8() != data || std::any_of(text.cbegin(), text.cend(), [](QChar ch) {
+            return ch.category() == QChar::Other_Control && ch != '\t' && ch != '\r' && ch != '\n';
+        });
+    }
+    if (hex) text = QString::fromLatin1(data.toHex(' ').toUpper());
+
+    const bool needsNewline = m_pendingReceiveText.isEmpty()
+        ? textReceive->document()->lastBlock().length() > 1
+        : !m_pendingReceiveText.endsWith('\n') && !m_pendingReceiveText.endsWith('\r');
+    QString prefix = needsNewline ? QStringLiteral("\n") : QString();
+    if (chkTimestamp->isChecked())
+        prefix += QStringLiteral("[%1] ").arg(QTime::currentTime().toString(QStringLiteral("HH:mm:ss.zzz")));
+    prefix += QStringLiteral("[TX] ");
+    // Reserve space for the direction label even if a single send fills the cache.
+    const QString omitted = QStringLiteral("… ");
+    const int originalSize = text.size();
+    ReceiveConsoleBuffer::trimPending(text, hex, m_systemPreferences.receiveLines - 1,
+        m_systemPreferences.receiveCharacters - prefix.size() - omitted.size() - 1);
+    if (text.size() < originalSize) prefix += omitted;
+    m_hasTransmitEcho = true;
+    appendReceiveText(text, prefix);
 }
 void MainWindow::trimReceiveText()
 {
-    ReceiveConsoleBuffer::trimPending(receiveTextBuffer, chkHexReceive->isChecked(),
-        m_systemPreferences.receiveLines, m_systemPreferences.receiveCharacters);
+    m_pendingReceiveText.trim(chkHexReceive->isChecked(), m_systemPreferences.receiveLines, m_systemPreferences.receiveCharacters);
     ReceiveConsoleBuffer::trimDocument(textReceive->document(), chkHexReceive->isChecked(), m_systemPreferences.receiveCharacters);
 }
 void MainWindow::flushReceiveText()
 {
-    if (receiveTextBuffer.isEmpty()) return;
-    ReceiveConsoleBuffer::trimPending(receiveTextBuffer, chkHexReceive->isChecked(),
-        m_systemPreferences.receiveLines, m_systemPreferences.receiveCharacters);
+    if (m_pendingReceiveText.isEmpty()) return;
+    m_pendingReceiveText.trim(chkHexReceive->isChecked(), m_systemPreferences.receiveLines, m_systemPreferences.receiveCharacters);
     QTextCursor cursor(textReceive->document());
     cursor.beginEditBlock();
     // Evict BEFORE insertion so an oversized paragraph is never laid out and
     // then laid out a second time just to remove its oldest prefix.
     ReceiveConsoleBuffer::trimDocument(textReceive->document(), chkHexReceive->isChecked(),
-        qMax(0, m_systemPreferences.receiveCharacters - receiveTextBuffer.size()));
+        qMax(0, m_systemPreferences.receiveCharacters - m_pendingReceiveText.size()));
     cursor.movePosition(QTextCursor::End);
-    cursor.insertText(receiveTextBuffer);
-    receiveTextBuffer.clear();
+    m_pendingReceiveText.insertInto(cursor);
+    m_pendingReceiveText.clear();
     cursor.endEditBlock();
     cursor.movePosition(QTextCursor::End);
     textReceive->setTextCursor(cursor);
@@ -602,7 +663,8 @@ QString MainWindow::consoleSendUnavailableReason() const
         if (m_serialBreakActive || m_serialBreakPending || m_serialSendCancelPending) return "请先释放 Break 或完成取消发送操作。";
         if (!serialHandler || !serialHandler->sendSessionReady(m_serialOpenRequestId)) return "串口发送会话尚未就绪。";
     } else if (isNetworkInterface(interfaceType)) {
-        if (!networkHandler || !networkHandler->sendReady()) return interfaceType == 5 ? "UDP 未设置远端 IP/端口，仅可接收。" : "网络客户端未连接，暂时不能发送。";
+        if (!networkHandler || !networkHandler->sendReady() || (interfaceType == 2 && !m_tcpServerSendSession))
+            return interfaceType == 5 ? "UDP 未设置远端 IP/端口，仅可接收。" : "网络客户端未连接，暂时不能发送。";
     } else if (interfaceType == 4) {
         if (!bleClient || !bleClient->canSend() || bleClient->state() != BleHostClient::State::Ready) return "BLE 发送通道尚未就绪。";
         if (bleClient->fileSendBusy()) return "BLE 文件发送期间不能混入定时发送数据。";
@@ -645,7 +707,7 @@ void MainWindow::onConsolePeriodicSendTimer()
     if (!consoleSendTimer->isActive() || !chkConsolePeriodicSend->isChecked()) return;
     QByteArray data; QString error = consoleSendUnavailableReason();
     if (!error.isEmpty() || !consoleSendPayload(data, error)) { stopConsolePeriodicSend("定时发送已停止：" + error); return; }
-    sendDataToCurrentInterface(data);
+    sendDataToCurrentInterface(data, chkHexSend->isChecked());
 }
 void MainWindow::onSend()
 {
@@ -658,9 +720,9 @@ void MainWindow::onSend()
     QByteArray sendData; QString error;
     if (!consoleSendPayload(sendData, error)) { QMessageBox::warning(this, "无法发送", error); return; }
 
-    sendDataToCurrentInterface(sendData);
+    sendDataToCurrentInterface(sendData, chkHexSend->isChecked());
 }
-bool MainWindow::sendDataToCurrentInterface(const QByteArray &data)
+bool MainWindow::sendDataToCurrentInterface(const QByteArray &data, bool hexEcho)
 {
     if (data.isEmpty()) return false;
     if (!connectionIsReady()) { stopConsolePeriodicSend("连接已关闭，定时发送已停止。"); return false; }
@@ -682,7 +744,9 @@ bool MainWindow::sendDataToCurrentInterface(const QByteArray &data)
             return false;
         }
     } else if (isNetworkInterface(interfaceIdx) && networkHandler) {
-        if ((fileSendTimer && fileSendTimer->isActive()) || !networkHandler->enqueueData(data)) {
+        if ((fileSendTimer && fileSendTimer->isActive())
+            || (interfaceIdx == 2 && !m_tcpServerSendSession)
+            || !networkHandler->enqueueData(data, interfaceIdx == 2 ? m_tcpServerSendSession : 0)) {
             if (cmdWindow) cmdWindow->forceStopAllTimers();
             const QString message = interfaceIdx == 5
                 ? "未发送：UDP 未设置远端 IP/端口、单包超过 65507 字节，或待发送队列已满。命令循环已停止，本次不会自动重发。"
@@ -704,6 +768,7 @@ bool MainWindow::sendDataToCurrentInterface(const QByteArray &data)
             return false;
         }
     } else return false;
+    appendTransmitEcho(data, hexEcho);
     return true; // Queue admission only; not delivery or device acknowledgement.
 }
 void MainWindow::handleProtocolChanged(int index)
@@ -718,7 +783,7 @@ void MainWindow::handleSerialDataReceived(const QByteArray &data)
 {
     if (comboInterface && comboInterface->currentData().toInt() == 4) return;
     // If not checked, drop the text completely to save CPU/UI overhead
-    if (!chkShowReceiveData->isChecked()) { m_receiveDecoder.reset(); return; }
+    if (!chkShowReceiveData->isChecked()) return;
     
     QString timestamp;
     if (chkTimestamp && chkTimestamp->isChecked()) {
@@ -726,7 +791,6 @@ void MainWindow::handleSerialDataReceived(const QByteArray &data)
     }
     
     if (chkHexReceive->isChecked()) {
-        m_receiveDecoder.reset();
         QString out = timestamp + data.toHex(' ').toUpper() + " ";
         if (!timestamp.isEmpty()) out += "\n";
         appendReceiveText(out);
@@ -740,9 +804,7 @@ void MainWindow::handleSerialDataReceived(const QByteArray &data)
         // Serial/TCP may split a Chinese character across readyRead batches.
         // Keep its partial bytes until the next batch rather than emitting �.
         const QString txt = m_receiveDecoder->toUnicode(data);
-        QString out = timestamp + txt;
-        if (!timestamp.isEmpty() && !txt.endsWith("\n")) out += "\n";
-        appendReceiveText(out);
+        appendReceiveText(txt, timestamp, comboInterface->currentData().toInt() == 0);
     }
 }
 void MainWindow::handleSerialOpenFinished(quint64 requestId, bool success, const QString &errorMsg, int errorCode)
@@ -1187,26 +1249,74 @@ void MainWindow::handleNetworkStateChanged(bool isConnected)
     }
 }
 
-void MainWindow::handleClientConnected(const QString &clientIp)
+void MainWindow::handleClientConnected(const QString &clientIp, quint64 sendSession)
 {
-    if (lblServerConnCount && lblServerCurrentConn) {
-        QString ip = clientIp;
-        if (ip.startsWith("::ffff:")) {
-            ip = ip.mid(7);
-        }
-        lblServerConnCount->setText("1");
-        lblServerCurrentConn->setText(ip);
-    }
+    if (!connectionIsReady() || m_activeInterfaceType != 2) return;
+    m_tcpServerSendSession = sendSession;
+    resetReceiveTextDecoder();
+    lblServerConnCount->setText(QStringLiteral("1"));
+    lblServerCurrentConn->setText(clientIp.startsWith("::ffff:") ? clientIp.mid(7) : clientIp);
+    handleTcpServerWaitChanged(m_tcpServerWaitReason);
+    updateTcpServerPeerNotice();
     updateConsoleSendControls();
 }
 
-void MainWindow::handleClientDisconnected()
+void MainWindow::handleClientDisconnected(const QString &reason)
 {
-    if (lblServerConnCount && lblServerCurrentConn) {
-        lblServerConnCount->setText("0");
-        lblServerCurrentConn->setText("无");
+    if (!connectionIsReady() || m_activeInterfaceType != 2) return;
+    m_tcpServerSendSession = 0;
+    lblServerConnCount->setText(QStringLiteral("0"));
+    lblServerCurrentConn->setText(QStringLiteral("无"));
+    handleTcpServerWaitChanged(m_tcpServerWaitReason);
+    if (cmdWindow) cmdWindow->forceStopAllTimers();
+    stopConsolePeriodicSend();
+    if (fileSendTimer->isActive() || fileToSend->isOpen()) onStopSendFile();
+    m_tcpServerDisconnectReason = reason.isEmpty() ? QStringLiteral("TCP 客户端已断开。") : reason;
+    if (!m_tcpServerPeerNotice) {
+        m_tcpServerPeerNotice = new QDialog(this);
+        m_tcpServerPeerNotice->setObjectName(QStringLiteral("tcpServerPeerNotice"));
+        m_tcpServerPeerNotice->setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+        m_tcpServerPeerNotice->setMinimumWidth(360);
+        auto layout = new QVBoxLayout(m_tcpServerPeerNotice);
+        m_tcpServerPeerNoticeText = new QLabel(m_tcpServerPeerNotice);
+        m_tcpServerPeerNoticeText->setObjectName(QStringLiteral("tcpServerPeerNoticeText"));
+        m_tcpServerPeerNoticeText->setTextFormat(Qt::PlainText);
+        m_tcpServerPeerNoticeText->setWordWrap(true);
+        layout->addWidget(m_tcpServerPeerNoticeText);
+        auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok, m_tcpServerPeerNotice);
+        buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("确定"));
+        connect(buttons, &QDialogButtonBox::accepted, m_tcpServerPeerNotice, &QDialog::accept);
+        layout->addWidget(buttons);
     }
+    updateTcpServerPeerNotice();
+    m_tcpServerPeerNotice->show();
     updateConsoleSendControls();
+}
+
+void MainWindow::updateTcpServerPeerNotice()
+{
+    if (!m_tcpServerPeerNotice || m_activeInterfaceType != 2) return;
+    if (m_tcpServerSendSession) {
+        m_tcpServerPeerNotice->setWindowTitle(QStringLiteral("TCP 连接已恢复"));
+        QString message = QStringLiteral("设备已重新连接，可以继续接收数据。");
+        if (isRecording) message += QStringLiteral("\n\n录制继续写入原文件。");
+        m_tcpServerPeerNoticeText->setText(message);
+        return;
+    }
+    m_tcpServerPeerNotice->setWindowTitle(QStringLiteral("TCP 客户端已断开"));
+    QString message = m_tcpServerDisconnectReason + QStringLiteral("\n服务器保持开启，等待设备重新连接。");
+    if (isRecording) {
+        message += QStringLiteral("\n\n录制仍在进行，重连后继续写入原文件。你可以随时点击「停止录制」。");
+    }
+    m_tcpServerPeerNoticeText->setText(message);
+}
+
+void MainWindow::handleTcpServerWaitChanged(const QString &reason)
+{
+    if (!connectionIsReady() || m_activeInterfaceType != 2) return;
+    m_tcpServerWaitReason = reason;
+    lblStatusMessage->setText(!reason.isEmpty() ? reason
+        : m_tcpServerSendSession ? QStringLiteral("TCP 客户端已连接") : QStringLiteral("TCP 监听中，等待设备连接"));
 }
 
 QString MainWindow::getBluetoothNameForComPort(const QString &portName)
@@ -1357,7 +1467,8 @@ void MainWindow::onStartSendFile()
     
     const int interfaceType = comboInterface->currentData().toInt();
     if ((interfaceType == 1 || interfaceType == 2) &&
-        (!networkHandler->sendReady() || networkHandler->pendingSendBytes() > 0)) {
+        (!networkHandler->sendReady() || (interfaceType == 2 && !m_tcpServerSendSession)
+         || networkHandler->pendingSendBytes() > 0)) {
         fileToSend->close();
         QMessageBox::warning(this, "暂时无法发送文件", "请先等待网络客户端连接并完成已有待发送数据，再开始文件发送。"); return;
     }
@@ -1433,7 +1544,9 @@ void MainWindow::onFileSendTimer()
         if (!serialHandler->enqueueData(m_serialOpenRequestId, chunk)) {
             cancelSerialSend();
             statusBar()->showMessage(QStringLiteral("文件发送已停止：连接关闭或发送队列已满，未自动重发。"), 6000);
+            return;
         }
+        appendTransmitEcho(chunk, true);
         return;
     }
     if (!isPortOpen) {
@@ -1445,8 +1558,10 @@ void MainWindow::onFileSendTimer()
     if (interfaceType != 1 && interfaceType != 2) {
         onStopSendFile(); statusBar()->showMessage("当前接口不支持文件发送。", 5000); return;
     }
-    if (!networkHandler->sendReady()) {
-        onStopSendFile(); QMessageBox::warning(this, "文件发送已停止", "网络客户端已断开，未完成数据不会自动重发。"); return;
+    if (!networkHandler->sendReady() || (interfaceType == 2 && !m_tcpServerSendSession)) {
+        onStopSendFile();
+        statusBar()->showMessage(QStringLiteral("网络客户端已断开，文件发送已停止。"), 6000);
+        return;
     }
     const qint64 pending = networkHandler->pendingSendBytes();
     if (fileToSend->isOpen() && fileToSend->size() > 0) {
@@ -1462,10 +1577,13 @@ void MainWindow::onFileSendTimer()
     }
     
     const QByteArray chunk = fileToSend->read(4096);
-    if (chunk.isEmpty() || fileToSend->error() != QFile::NoError || !networkHandler->enqueueData(chunk)) {
+    if (chunk.isEmpty() || fileToSend->error() != QFile::NoError
+        || !networkHandler->enqueueData(chunk, interfaceType == 2 ? m_tcpServerSendSession : 0)) {
         const QString detail = fileToSend->errorString(); onStopSendFile();
         QMessageBox::warning(this, "文件发送失败", "源文件读取失败或网络发送通道不可用。已停止发送，未自动重发。\n" + detail);
+        return;
     }
+    appendTransmitEcho(chunk, true);
 }
 
 void MainWindow::startFileSendEta()

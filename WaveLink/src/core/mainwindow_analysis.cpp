@@ -48,6 +48,7 @@
 #include <QPlainTextEdit>
 #include <QAbstractSpinBox>
 #include <QSignalBlocker>
+#include <QFontMetrics>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -159,8 +160,6 @@ void MainWindow::onSpectrumTimer()
     for (QAction *a : actions) {
         if (a->isChecked()) activeChannels.append(a->data().toInt());
     }
-    
-    if (activeChannels.isEmpty()) return;
     
     // Ensure we have enough spectrum graphs
     while (spectrumGraphs.size() < channelGraphs.size()) {
@@ -281,10 +280,8 @@ void MainWindow::onSpectrumTimer()
         QCPGraph *targetGraph = spectrumGraphs[chIdx];
         targetGraph->setData(freqs, mags);
         
-        // Sync color
-        if (chIdx < defaultColors.size()) {
-            targetGraph->setPen(QPen(defaultColors[chIdx], 1));
-        }
+        // Use the actual channel color, including a user's custom color.
+        targetGraph->setPen(QPen(srcGraph->pen().color(), 1));
         targetGraph->setVisible(true);
     }
     
@@ -292,7 +289,7 @@ void MainWindow::onSpectrumTimer()
         spectrumWarningText->setText(hasInvalidInput
             ? QStringLiteral("当前可视数据包含非数值或无效值，暂无有效频谱。")
             : QString("主视图中可视的数据点不足 (当前要求至少 %1 个点)\n请尝试放大主视图的时间窗口，或缩减 FFT点数设置。").arg(minPoints));
-        spectrumWarningText->setVisible(true);
+        spectrumWarningText->setVisible(!activeChannels.isEmpty());
     } else {
         spectrumWarningText->setVisible(false);
     }
@@ -329,7 +326,7 @@ void MainWindow::onSpectrumTimer()
     }
 
     if (!legendEntries.isEmpty() && spectrumLegendText) {
-        spectrumLegendText->setText(legendEntries.join("  "));
+        spectrumLegendText->setText(legendEntries.join('\n'));
         spectrumLegendText->setVisible(true);
     } else if (spectrumLegendText) {
         spectrumLegendText->setVisible(false);
@@ -385,6 +382,67 @@ void MainWindow::onSpectrumTimer()
     }
 
     spectrumPlot->replot(QCustomPlot::rpQueuedReplot);
+}
+
+void MainWindow::updateSpectrumLegendLayout()
+{
+    auto legend = spectrumPlot->legend;
+    QList<QCPGraph *> visible;
+    for (int channel = 0; channel < spectrumGraphs.size(); ++channel) {
+        auto graph = spectrumGraphs[channel];
+        if (graph->visible() && channel < channelGraphs.size()) {
+            graph->setProperty("spectrumChannelName", channelGraphs[channel]->name());
+            graph->addToLegend();
+            visible.append(graph);
+        } else {
+            graph->removeFromLegend();
+        }
+    }
+    legend->setVisible(!visible.isEmpty());
+
+    const bool dark = qApp->property("waveLinkDarkTheme").toBool();
+    const QColor text = dark ? QColor("#eeeeee") : QColor("#202020");
+    const QBrush background(dark ? QColor(30, 30, 30, 235) : QColor(255, 255, 255, 235));
+    const QPen border(dark ? QColor("#666666") : QColor("#b0b0b0"));
+    legend->setTextColor(text);
+    legend->setBrush(background);
+    legend->setBorderPen(border);
+    spectrumLegendText->setColor(text);
+    spectrumLegendText->setBrush(background);
+    spectrumLegendText->setPen(border);
+    spectrumLegendText->position->setCoords(0.02, 0.02);
+    if (visible.isEmpty()) return;
+
+    // Use the viewport so resizing is handled before the axis layout catches up.
+    const auto margins = spectrumPlot->axisRect()->margins();
+    const auto inset = spectrumPlot->axisRect()->insetLayout()->margins();
+    const int axisHeight = qMax(1, spectrumPlot->viewport().height() - margins.top() - margins.bottom());
+    const int width = qMax(60, spectrumPlot->viewport().width() - margins.left() - margins.right() - inset.left() - inset.right());
+    const int height = qMax(30, axisHeight - inset.top() - inset.bottom());
+    const QFontMetrics font(legend->font()), filterFont(spectrumLegendText->font());
+    int nameWidth = 0;
+    for (auto graph : visible) nameWidth = qMax(nameWidth, font.horizontalAdvance(graph->property("spectrumChannelName").toString()));
+    int filterWidth = 0;
+    for (const auto &line : spectrumLegendText->text().split('\n')) filterWidth = qMax(filterWidth, filterFont.horizontalAdvance(line));
+    const auto padding = spectrumLegendText->padding();
+    filterWidth += padding.left() + padding.right();
+    const int filterHeight = filterFont.lineSpacing() * spectrumLegendText->text().count('\n') + filterFont.height() + padding.top() + padding.bottom();
+    const int iconWidth = legend->iconSize().width() + legend->iconTextPadding();
+    const bool filtering = spectrumLegendText->visible();
+    const bool beside = !filtering || width >= filterWidth + 16 + qMin(240, nameWidth + iconWidth + 12);
+    const int legendWidth = beside && filtering ? width - filterWidth - 16 : width;
+    const int legendHeight = beside ? height : qMax(20, height - filterHeight - 8);
+    const int rowHeight = qMax(font.height(), legend->iconSize().height());
+    const int rows = qMax(1, (legendHeight - 8) / rowHeight);
+    const int columns = qBound(1, (visible.size() + rows - 1) / rows, qMax(1, legendWidth / (iconWidth + 40)));
+    legend->setWrap(columns);
+    legend->setFillOrder(QCPLayoutGrid::foColumnsFirst, true);
+    const int textWidth = qMax(16, qMin(240, (legendWidth - 12 - (columns - 1) * legend->columnSpacing()) / columns - iconWidth));
+    for (auto graph : visible) graph->setName(font.elidedText(graph->property("spectrumChannelName").toString(), Qt::ElideRight, textWidth));
+    if (filtering && !beside) {
+        // Stack the filter badge below the legend when both corners won't fit.
+        spectrumLegendText->position->setCoords(0.02, (legend->minimumOuterSizeHint().height() + inset.top() + 8.0) / axisHeight);
+    }
 }
 
 

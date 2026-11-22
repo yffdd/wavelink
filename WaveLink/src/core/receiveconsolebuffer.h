@@ -5,6 +5,7 @@
 #include <QTextBlock>
 #include <QTextCursor>
 #include <QTextDocument>
+#include <deque>
 
 // Display-only retention. Never apply these limits to parsers or recordings.
 namespace ReceiveConsoleBuffer {
@@ -46,6 +47,62 @@ inline void trimPending(QString &text, bool hex, int lines = 0, int characters =
         search = newline - 1;
     }
 }
+
+class PendingText {
+public:
+    bool isEmpty() const { return m_text.isEmpty(); }
+    bool endsWith(QChar character) const { return m_text.endsWith(character); }
+    int size() const { return m_text.size(); }
+
+    void append(const QStringRef &text, const QTextCharFormat &format = {}) {
+        if (text.isEmpty()) return;
+        const qint64 begin = m_offset + size();
+        m_text.append(text);
+        if (format.isEmpty()) return;
+        const qint64 end = m_offset + size();
+        if (!m_spans.empty() && m_spans.back().end == begin && m_spans.back().format == format)
+            m_spans.back().end = end;
+        else
+            m_spans.push_back({begin, end, format});
+    }
+
+    void trim(bool hex, int lines, int characters) {
+        const int previousSize = size();
+        trimPending(m_text, hex, lines, characters);
+        // Keep offsets stable as the oldest text and its styles are evicted.
+        m_offset += previousSize - size();
+        while (!m_spans.empty() && m_spans.front().end <= m_offset) m_spans.pop_front();
+    }
+
+    void insertInto(QTextCursor &cursor) const {
+        int position = 0;
+        for (const auto &span : m_spans) {
+            const int begin = int(qMax(m_offset, span.begin) - m_offset);
+            const int end = int(span.end - m_offset);
+            if (begin > position) cursor.insertText(m_text.mid(position, begin - position), QTextCharFormat());
+            cursor.insertText(m_text.mid(begin, end - begin), span.format);
+            position = end;
+        }
+        if (position < size()) cursor.insertText(m_text.mid(position), QTextCharFormat());
+    }
+
+    void clear() {
+        m_text.clear();
+        m_spans.clear();
+        m_offset = 0;
+    }
+
+private:
+    struct Span {
+        qint64 begin;
+        qint64 end;
+        QTextCharFormat format;
+    };
+    QString m_text;
+    std::deque<Span> m_spans;
+    qint64 m_offset = 0;
+};
+
 inline void trimDocument(QTextDocument *document, bool hex, int characters = DefaultCharacters) {
     // QTextDocument includes a final paragraph sentinel, not received data.
     const int length = document->characterCount() - 1;

@@ -55,6 +55,8 @@
 #include <QCryptographicHash>
 #include <QSaveFile>
 #include "receiveconsolebuffer.h"
+#include "globaltimemeasurement.h"
+#include "waveformgraph.h"
 #include "connectionhints.h"
 #include <QPainter>
 #include <QPainterPath>
@@ -188,6 +190,7 @@ MainWindow::MainWindow(QWidget *parent, SerialHandler *serialBackend)
     connect(networkHandler, &NetworkHandler::connectionStateChanged, this, &MainWindow::handleNetworkStateChanged);
     connect(networkHandler, &NetworkHandler::clientConnected, this, &MainWindow::handleClientConnected);
     connect(networkHandler, &NetworkHandler::clientDisconnected, this, &MainWindow::handleClientDisconnected);
+    connect(networkHandler, &NetworkHandler::tcpServerWaitChanged, this, &MainWindow::handleTcpServerWaitChanged);
     connect(networkHandler, &NetworkHandler::localEndpointChanged, this, [this](const QString &address, int port) {
         const int mode = comboInterface->currentData().toInt();
         auto label = mode == 5 ? lblUdpEndpoint : lblClientEndpoint;
@@ -461,6 +464,7 @@ void MainWindow::setupUi()
     
     plotScrollArea = new PlotScrollArea(mainCentral);
     plotScrollArea->setWidget(innerMainWindow);
+    plotScrollArea->viewport()->installEventFilter(this);
     connect(plotScrollArea->verticalScrollBar(), &QScrollBar::valueChanged, this, [this] {
         // A newly revealed detached plot may have been skipped while clipped.
         for (const auto &ctx : allPlots)
@@ -468,6 +472,19 @@ void MainWindow::setupUi()
         if (chkAutoScaleY && chkAutoScaleY->isChecked()) yScaleTimer->start(0);
     });
     mainLayout->addWidget(plotScrollArea, 1);
+    m_globalTimeMeasurement = new GlobalTimeMeasurement(mainCentral,
+        [this] {
+            QStringList names;
+            for (int i = 0; i < channelGraphs.size(); ++i) names.append(channelDisplayName(i));
+            return names;
+        },
+        [this](int channel, double time) {
+            if (channel < 0 || channel >= channelGraphs.size()) return time;
+            const auto graph = dynamic_cast<WaveformGraph *>(channelGraphs[channel]);
+            return graph ? graph->nearestSampleTime(time) : time;
+        },
+        [this](double lower, double upper) { locateGlobalTimeInterval(lower, upper); });
+    mainLayout->addWidget(m_globalTimeMeasurement->bar(), 0);
     mainLayout->addLayout(sliderLayout, 0);
     
     setCentralWidget(mainCentral);
@@ -504,6 +521,7 @@ void MainWindow::setupMenuAndStatusBar()
     setStatusBar(sBar);
     
     lblStatusMessage = new QLabel("Welcome to WaveLink");
+    lblStatusMessage->setObjectName(QStringLiteral("lblStatusMessage"));
     sBar->addWidget(lblStatusMessage, 1);
     lblRecordingWarning = new QLabel;
     lblRecordingWarning->setObjectName("lblRecordingWarning");
@@ -744,7 +762,18 @@ void MainWindow::setupDockWidgets()
     btnProtocolHelp->setToolTip("查看各数据协议的通讯规范及收发示例");
     btnProtocolHelp->setFixedWidth(30);
     
+    btnDemoProtocolInfo = new QPushButton(QStringLiteral("Demo 数据（无需协议）"));
+    btnDemoProtocolInfo->setObjectName("btnDemoProtocolInfo");
+    btnDemoProtocolInfo->setMinimumWidth(comboProtocol->minimumWidth());
+    btnDemoProtocolInfo->setToolTip(QStringLiteral("查看 Demo 数据的协议说明"));
+    btnDemoProtocolInfo->hide();
+    connect(btnDemoProtocolInfo, &QPushButton::clicked, this, [this] {
+        QMessageBox::information(this, QStringLiteral("Demo 数据说明"),
+            QStringLiteral("Demo 数据由 WaveLink 内置生成，无需选择数据协议。\n"
+                           "连接外部设备时，可在切换数据接口后选择对应协议。"));
+    });
     protocolTopLayout->addWidget(comboProtocol);
+    protocolTopLayout->addWidget(btnDemoProtocolInfo);
     protocolTopLayout->addWidget(btnProtocolHelp);
     
     comboEndianness = new QComboBox();
@@ -848,7 +877,18 @@ void MainWindow::setupDockWidgets()
     }
     
     comboBaudRate = new QComboBox();
-    comboBaudRate->addItems({"9600", "19200", "38400", "57600", "115200", "460800", "921600", "1000000", "2000000"});
+    comboBaudRate->setObjectName(QStringLiteral("comboBaudRate"));
+    // Keep the saved selection IDs independent of the display order.
+    comboBaudRate->addItem("9600", 0);
+    comboBaudRate->addItem("19200", 1);
+    comboBaudRate->addItem("38400", 2);
+    comboBaudRate->addItem("57600", 3);
+    comboBaudRate->addItem("115200", 4);
+    comboBaudRate->addItem("230400", 230400);
+    comboBaudRate->addItem("460800", 5);
+    comboBaudRate->addItem("921600", 6);
+    comboBaudRate->addItem("1000000", 7);
+    comboBaudRate->addItem("2000000", 8);
     comboBaudRate->setCurrentText(settings.value("BaudRate", "115200").toString());
     comboBaudRate->setEditable(true);
     
@@ -1016,7 +1056,7 @@ void MainWindow::setupDockWidgets()
     serverLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     serverLayout->setHorizontalSpacing(6);
     comboServerIP = addressChoice("comboServerIP", settings.value("ServerIP", "0.0.0.0").toString());
-    comboServerIP->setToolTip("TCP 服务端的监听地址，可手动输入或下拉选择。0.0.0.0 监听所有本机 IPv4 地址；127.0.0.1 仅接受本机连接。指定地址必须属于当前电脑；IPv6 可输入 :: 或具体地址。");
+    comboServerIP->setToolTip("TCP 服务端的监听地址，可手动输入或下拉选择。0.0.0.0 监听所有本机 IPv4 地址，适合 Wi-Fi 重连后电脑 IP 可能变化的情况。设备需连接电脑当前的实际 IP。127.0.0.1 仅接受本机连接。IPv6 可输入 :: 或具体地址。");
     auto serverAddressRow = new QWidget; auto serverAddressLayout = new QVBoxLayout(serverAddressRow);
     serverAddressLayout->setContentsMargins(0, 0, 0, 0); serverAddressLayout->setSpacing(4);
     auto listenHint = new QLabel; listenHint->setObjectName("lblServerListenHint"); listenHint->setWordWrap(true); listenHint->setTextFormat(Qt::PlainText);
@@ -1434,8 +1474,13 @@ void MainWindow::setupDockWidgets()
     QHBoxLayout *rxToolbarLayout = new QHBoxLayout();
     chkShowReceiveData = new QCheckBox("显示接收数据");
     chkShowReceiveData->setChecked(true); // Default to showing data
+    connect(chkShowReceiveData, &QCheckBox::toggled, this, [this](bool shown) {
+        if (!shown) resetReceiveTextDecoder();
+    });
     chkHexReceive = new QCheckBox("HEX 接收");
     chkHexReceive->setObjectName("chkHexReceive");
+    chkHexReceive->setToolTip(QStringLiteral("以十六进制显示收到的原始字节。串口文本模式会自动识别 ANSI 颜色码。"));
+    connect(chkHexReceive, &QCheckBox::toggled, this, &MainWindow::resetReceiveTextDecoder);
     btnClearReceive = new QPushButton("清空接收");
     btnClearReceive->setObjectName("btnClearReceive");
     btnSaveReceive = new QPushButton("保存接收");
@@ -1448,7 +1493,9 @@ void MainWindow::setupDockWidgets()
     connect(btnCopyReceive, &QPushButton::clicked, this, &MainWindow::onCopyReceive);
     
     connect(chkHexReceive, &QCheckBox::clicked, this, [this](bool checked) {
-        flushReceiveText(); // Convert pending display text together with the visible history.
+        flushReceiveText();
+        // Mixed receive/send history is already formatted and contains direction labels.
+        if (m_hasTransmitEcho) return;
         QString text = textReceive->toPlainText();
         if (text.isEmpty()) return;
         
@@ -1470,9 +1517,9 @@ void MainWindow::setupDockWidgets()
             // HEX to Text
             QString hexStr = text.remove(" ").remove("\n").remove("\r");
             QByteArray bytes = QByteArray::fromHex(hexStr.toUtf8());
-            auto decoded = codec->toUnicode(bytes);
-            ReceiveConsoleBuffer::trimPending(decoded, false, m_systemPreferences.receiveLines, m_systemPreferences.receiveCharacters);
-            textReceive->setPlainText(decoded);
+            textReceive->clear();
+            appendReceiveText(codec->toUnicode(bytes), {}, comboInterface->currentData().toInt() == 0);
+            flushReceiveText();
         }
         
         QTextCursor cursor = textReceive->textCursor();
@@ -1483,6 +1530,7 @@ void MainWindow::setupDockWidgets()
     
     comboEncoding = new QComboBox();
     comboEncoding->addItems({"UTF-8", "GBK"});
+    connect(comboEncoding, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::resetReceiveTextDecoder);
 
     lblRxCount = new QLabel("Rx: 0");
     lblTxCount = new QLabel("Tx: 0");
@@ -1523,6 +1571,10 @@ void MainWindow::setupDockWidgets()
     // Keep the console compact; the splitter can still be enlarged manually.
     textReceive->setMinimumHeight(40);
     auto rxHistoryLayout = new QHBoxLayout;
+    chkShowTransmitData = new QCheckBox(QStringLiteral("显示发送数据"));
+    chkShowTransmitData->setObjectName(QStringLiteral("chkShowTransmitData"));
+    chkShowTransmitData->setToolTip(QStringLiteral("在接收窗口用 [TX] 标记回显提交发送的数据。HEX 发送和文件数据以十六进制显示。"));
+    rxHistoryLayout->addWidget(chkShowTransmitData);
     rxHistoryLayout->addWidget(btnSaveReceive);
     rxHistoryLayout->addWidget(btnCopyReceive);
     auto receiveCacheLabel = new QLabel("显示缓存");
@@ -1821,6 +1873,15 @@ void MainWindow::setupDockWidgets()
 
     
     spectrumPlot = new QCustomPlot();
+    spectrumPlot->setObjectName("spectrumPlot");
+    spectrumPlot->setAutoAddPlottableToLegend(false);
+    spectrumPlot->legend->setSelectableParts(QCPLegend::spNone);
+    spectrumPlot->legend->setFont(QFont("Arial", 9));
+    spectrumPlot->legend->setIconSize(22, 12);
+    spectrumPlot->legend->setMargins(QMargins(6, 4, 6, 4));
+    spectrumPlot->legend->setColumnSpacing(10);
+    spectrumPlot->legend->setRowSpacing(0);
+    spectrumPlot->legend->setFillOrder(QCPLayoutGrid::foColumnsFirst);
     spectrumPlot->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     spectrumPlot->installEventFilter(this);
     int themeIdx = settings.value("comboTheme", 0).toInt();
@@ -1875,11 +1936,13 @@ void MainWindow::setupDockWidgets()
     spectrumLegendText->setBrush(QBrush(QColor(18, 18, 18, 200)));
     spectrumLegendText->setPen(QPen(QColor("#444444"), 1));
     spectrumLegendText->setPadding(QMargins(6, 4, 6, 4));
-    spectrumLegendText->setPositionAlignment(Qt::AlignRight | Qt::AlignTop);
+    spectrumLegendText->setPositionAlignment(Qt::AlignLeft | Qt::AlignTop);
+    spectrumLegendText->setTextAlignment(Qt::AlignLeft);
     spectrumLegendText->position->setType(QCPItemPosition::ptAxisRectRatio);
-    spectrumLegendText->position->setCoords(0.98, 0.02);
+    spectrumLegendText->position->setCoords(0.02, 0.02);
     spectrumLegendText->setFont(QFont("Arial", 9, QFont::Bold));
     spectrumLegendText->setVisible(false);
+    connect(spectrumPlot, &QCustomPlot::beforeReplot, this, &MainWindow::updateSpectrumLegendLayout);
     
     spectrumTracerFixed = false;
 
@@ -1901,6 +1964,20 @@ void MainWindow::setupDockWidgets()
     spectrumFooter->installEventFilter(this);
     
     connect(spectrumPlot, &QCustomPlot::mouseMove, this, [this](QMouseEvent *event) {
+        QStringList names;
+        if (spectrumPlot->legend->visible() && spectrumPlot->legend->outerRect().contains(event->pos())) {
+            for (auto graph : spectrumGraphs) if (graph->visible())
+                names.append(graph->property("spectrumChannelName").toString());
+        }
+        spectrumPlot->setToolTip(names.join('\n'));
+        if (!names.isEmpty()) {
+            if (!spectrumTracerFixed) {
+                spectrumTracer->setVisible(false);
+                spectrumTracerText->setVisible(false);
+                spectrumPlot->replot(QCustomPlot::rpQueuedReplot);
+            }
+            return;
+        }
         if (!spectrumTracerFixed && spectrumGraphs.size() > 0) {
             double x = spectrumPlot->xAxis->pixelToCoord(event->pos().x());
             // Find closest active graph
